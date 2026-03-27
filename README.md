@@ -13,6 +13,7 @@ Real-time orderbook data from a local Hyperliquid node:
 - **bbo** - Best Bid/Offer (top of book) with deduplication
 - **l2Book** - Aggregated Level 2 orderbook with deduplication
 - **trades** - Real-time trade feed
+- **bookDiffs** - Raw book diff stream per coin
 - **l4Book** - Full Level 4 orderbook with individual order details
 - **orderUpdates** - User-specific order status stream
 
@@ -168,6 +169,16 @@ Response:
 ```
 Trades that are liquidations include an additional `liquidation` field with `liquidatedUser`, `markPx`, and `method`.
 
+### Subscribe to Book Diffs
+```json
+{ "method": "subscribe", "subscription": { "type": "bookDiffs", "coin": "BTC" } }
+```
+Response:
+```json
+{ "channel": "bookDiffs", "data": [{ "user": "0x...", "oid": 123, "px": "50000.0", "coin": "BTC", "rawBookDiff": { "new": { "sz": "1.0" } } }] }
+```
+Streams raw order book diffs as they arrive. Each diff is one of: `new` (order added), `update` (size changed with `origSz` and `newSz`), or `remove` (order removed).
+
 ### Subscribe to L2 Orderbook
 ```json
 { "method": "subscribe", "subscription": { "type": "l2Book", "coin": "BTC" } }
@@ -288,7 +299,7 @@ curl http://localhost:9090/metrics
 |----------|--------|-------------|
 | **Connections** | `ws_connections_active` | Current WebSocket connections |
 | | `ws_connections_total` | Total connections since startup |
-| | `ws_subscriptions_active{type}` | Active subscriptions by type (bbo/l2Book/l4Book/trades/orderUpdates) |
+| | `ws_subscriptions_active{type}` | Active subscriptions by type (bbo/l2Book/l4Book/trades/bookDiffs/orderUpdates) |
 | | `broadcast_receivers` | Number of broadcast channel receivers |
 | **Throughput** | `events_processed_total{type}` | Events by type (orders/diffs/fills) |
 | | `broadcasts_total{channel}` | Broadcasts by channel (bbo/l2/l4/trades) |

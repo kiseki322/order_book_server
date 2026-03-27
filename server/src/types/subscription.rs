@@ -1,5 +1,5 @@
 use crate::metrics::WS_SUBSCRIPTIONS_ACTIVE;
-use crate::types::node_data::NodeDataOrderStatus;
+use crate::types::node_data::{NodeDataOrderDiff, NodeDataOrderStatus};
 use crate::types::{Bbo, L2Book, L4Book, Trade};
 use alloy::primitives::Address;
 use log::info;
@@ -32,6 +32,8 @@ pub(crate) enum Subscription {
     Bbo { coin: String },
     #[serde(rename_all = "camelCase")]
     OrderUpdates { user: String },
+    #[serde(rename_all = "camelCase")]
+    BookDiffs { coin: String },
 }
 
 impl Subscription {
@@ -69,7 +71,7 @@ impl Subscription {
                 info!("Valid subscription");
                 true
             }
-            Self::L4Book { coin } | Self::Bbo { coin } => {
+            Self::L4Book { coin } | Self::Bbo { coin } | Self::BookDiffs { coin } => {
                 if !universe.contains(coin) {
                     info!("Invalid subscription: coin not found");
                     return false;
@@ -102,6 +104,7 @@ impl Subscription {
             Self::L4Book { .. } => "l4Book",
             Self::Trades { .. } => "trades",
             Self::OrderUpdates { .. } => "orderUpdates",
+            Self::BookDiffs { .. } => "bookDiffs",
         }
     }
 }
@@ -131,6 +134,7 @@ pub(crate) enum ServerResponse {
     L4Book(L4Book),
     Trades(Vec<Trade>),
     Bbo(Bbo),
+    BookDiffs(Vec<NodeDataOrderDiff>),
     OrderUpdates(Vec<OrderUpdate>),
     Pong,
     Error(String),
@@ -229,6 +233,18 @@ mod test {
         assert!(matches!(msg, ClientMessage::Subscribe { subscription: Subscription::OrderUpdates { .. } }));
         if let ClientMessage::Subscribe { subscription: Subscription::OrderUpdates { user } } = msg {
             assert_eq!(user, "0xABc1234567890abcDEF1234567890AbCdEf12345");
+        }
+    }
+
+    #[test]
+    fn test_book_diffs_subscription_deserialization() {
+        let message = r#"
+            { "method": "subscribe", "subscription":{ "type": "bookDiffs", "coin": "BTC" }}
+        "#;
+        let msg: ClientMessage = serde_json::from_str(message).unwrap();
+        assert!(matches!(msg, ClientMessage::Subscribe { subscription: Subscription::BookDiffs { .. } }));
+        if let ClientMessage::Subscribe { subscription: Subscription::BookDiffs { coin } } = msg {
+            assert_eq!(coin, "BTC");
         }
     }
 

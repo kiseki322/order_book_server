@@ -212,8 +212,10 @@ async fn handle_socket(
                             InternalMessage::L4OrderDiffs{ batch } => {
                                 // HFT mode: process diffs independently
                                 let mut book_updates = coin_to_book_diffs_only(batch);
+                                let mut raw_diffs = coin_to_book_diffs_raw(batch);
                                 for sub in manager.subscriptions() {
                                     send_ws_data_from_book_updates(&mut socket, sub, &mut book_updates).await;
+                                    send_ws_data_from_book_diffs_raw(&mut socket, sub, &mut raw_diffs).await;
                                 }
                             },
                             InternalMessage::L4OrderStatuses{ batch } => {
@@ -529,6 +531,30 @@ fn coin_to_book_statuses_only(status_batch: &Batch<NodeDataOrderStatus>) -> Hash
         updates.entry(coin).or_insert_with(|| L4BookUpdates::new(time, height)).order_statuses.push(status);
     }
     updates
+}
+
+fn coin_to_book_diffs_raw(batch: &Batch<NodeDataOrderDiff>) -> HashMap<String, Vec<NodeDataOrderDiff>> {
+    let diffs = batch.clone().events();
+    let mut grouped = HashMap::new();
+    for diff in diffs {
+        let coin = diff.coin().value();
+        grouped.entry(coin).or_insert_with(Vec::new).push(diff);
+    }
+    grouped
+}
+
+async fn send_ws_data_from_book_diffs_raw(
+    socket: &mut WebSocket,
+    subscription: &Subscription,
+    book_diffs: &mut HashMap<String, Vec<NodeDataOrderDiff>>,
+) {
+    if let Subscription::BookDiffs { coin } = subscription {
+        if let Some(diffs) = book_diffs.remove(coin) {
+            BROADCASTS_TOTAL.with_label_values(&["bookDiffs"]).inc();
+            let msg = ServerResponse::BookDiffs(diffs);
+            send_socket_message(socket, msg).await;
+        }
+    }
 }
 
 async fn send_ws_data_from_book_updates(
