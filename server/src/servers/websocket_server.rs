@@ -204,29 +204,43 @@ async fn handle_socket(
                                 }
                             },
                             InternalMessage::Fills{ batch } => {
-                                let mut trades = coin_to_trades(batch);
-                                for sub in manager.subscriptions() {
-                                    send_ws_data_from_trades(&mut socket, sub, &mut trades).await;
+                                let has_trades = manager.subscriptions().iter().any(|s| matches!(s, Subscription::Trades { .. }));
+                                if has_trades {
+                                    let mut trades = coin_to_trades(batch);
+                                    for sub in manager.subscriptions() {
+                                        send_ws_data_from_trades(&mut socket, sub, &mut trades).await;
+                                    }
                                 }
                             },
                             InternalMessage::L4OrderDiffs{ batch } => {
-                                // HFT mode: process diffs independently
-                                let mut book_updates = coin_to_book_diffs_only(batch);
-                                let mut raw_diffs = coin_to_book_diffs_raw(batch);
-                                for sub in manager.subscriptions() {
-                                    send_ws_data_from_book_updates(&mut socket, sub, &mut book_updates).await;
-                                    send_ws_data_from_book_diffs_raw(&mut socket, sub, &mut raw_diffs).await;
+                                let has_l4 = manager.subscriptions().iter().any(|s| matches!(s, Subscription::L4Book { .. }));
+                                let has_book_diffs = manager.subscriptions().iter().any(|s| matches!(s, Subscription::BookDiffs { .. }));
+                                if has_l4 || has_book_diffs {
+                                    let mut book_updates = if has_l4 { Some(coin_to_book_diffs_only(batch)) } else { None };
+                                    let mut raw_diffs = if has_book_diffs { Some(coin_to_book_diffs_raw(batch)) } else { None };
+                                    for sub in manager.subscriptions() {
+                                        if let Some(ref mut updates) = book_updates {
+                                            send_ws_data_from_book_updates(&mut socket, sub, updates).await;
+                                        }
+                                        if let Some(ref mut diffs) = raw_diffs {
+                                            send_ws_data_from_book_diffs_raw(&mut socket, sub, diffs).await;
+                                        }
+                                    }
                                 }
                             },
                             InternalMessage::L4OrderStatuses{ batch } => {
-                                // HFT mode: process statuses independently
-                                let mut book_updates = coin_to_book_statuses_only(batch);
-                                for sub in manager.subscriptions() {
-                                    send_ws_data_from_book_updates(&mut socket, sub, &mut book_updates).await;
+                                let has_l4 = manager.subscriptions().iter().any(|s| matches!(s, Subscription::L4Book { .. }));
+                                let has_order_updates = manager.subscriptions().iter().any(|s| matches!(s, Subscription::OrderUpdates { .. }));
+                                if has_l4 {
+                                    let mut book_updates = coin_to_book_statuses_only(batch);
+                                    for sub in manager.subscriptions() {
+                                        send_ws_data_from_book_updates(&mut socket, sub, &mut book_updates).await;
+                                    }
                                 }
-                                // Also handle OrderUpdates subscriptions
-                                for sub in manager.subscriptions() {
-                                    send_ws_order_updates(&mut socket, sub, batch).await;
+                                if has_order_updates {
+                                    for sub in manager.subscriptions() {
+                                        send_ws_order_updates(&mut socket, sub, batch).await;
+                                    }
                                 }
                             },
                         }
