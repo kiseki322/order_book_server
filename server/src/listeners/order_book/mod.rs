@@ -1,10 +1,5 @@
 use crate::{
     listeners::order_book::state::OrderBookState,
-    metrics::{
-        BBO_BROADCAST_LATENCY, EVENT_PROCESSING_LATENCY, EVENTS_PROCESSED_TOTAL, FILE_EVENTS_TOTAL,
-        FILE_LINES_PARSED_TOTAL, L2_BROADCAST_LATENCY, ORDERBOOK_COINS_COUNT, ORDERBOOK_HEIGHT, ORDERBOOK_ORDERS_TOTAL,
-        ORDERBOOK_TIME_MS, PARSE_ERRORS_TOTAL, PENDING_DIFFS_CACHE, PENDING_ORDERS_CACHE,
-    },
     order_book::{
         Coin, Px, Snapshot, Sz,
         multi_book::{Snapshots, load_snapshots_from_cli_json},
@@ -174,12 +169,6 @@ impl OrderBookListener {
             Ok(data) => data,
             Err(err) => {
                 // Log ALL parse errors for debugging
-                let err_source_label = match event_source {
-                    EventSource::Fills => "fills",
-                    EventSource::OrderStatuses => "orders",
-                    EventSource::OrderDiffs => "diffs",
-                };
-                PARSE_ERRORS_TOTAL.with_label_values(&[err_source_label]).inc();
                 static PARSE_ERR_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 let err_count = PARSE_ERR_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if err_count % 1000 == 0 {
@@ -192,16 +181,6 @@ impl OrderBookListener {
         // Log successful parses periodically
         static PARSE_OK_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let ok_count = PARSE_OK_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-        // Record file watcher metrics
-        let source_label = match event_source {
-            EventSource::Fills => "fills",
-            EventSource::OrderStatuses => "orders",
-            EventSource::OrderDiffs => "diffs",
-        };
-        FILE_EVENTS_TOTAL.with_label_values(&[source_label]).inc();
-        FILE_LINES_PARSED_TOTAL.with_label_values(&[source_label]).inc_by(line.len() as u64);
-        let process_start = Instant::now();
 
         if ok_count % 10_000 == 0 {
             info!("parse OK #{}: height={}, source={}", ok_count, height, event_source);
@@ -225,8 +204,6 @@ impl OrderBookListener {
                             drop(tx.send(msg));
                         });
                     }
-                    // Count order status events
-                    EVENTS_PROCESSED_TOTAL.with_label_values(&["orders"]).inc();
                     // Apply OrderStatuses directly using HFT method
                     state.apply_order_statuses_hft(batch)
                 }
@@ -240,15 +217,10 @@ impl OrderBookListener {
                             drop(tx.send(msg));
                         });
                     }
-                    // Count book diff events
-                    EVENTS_PROCESSED_TOTAL.with_label_values(&["diffs"]).inc();
                     // Apply OrderDiffs directly using HFT method
                     state.apply_order_diffs_hft(batch)
                 }
                 EventBatch::Fills(batch) => {
-                    // Count fill events
-                    EVENTS_PROCESSED_TOTAL.with_label_values(&["fills"]).inc();
-
                     // Broadcast fills immediately
                     if let Some(tx) = &self.internal_message_tx {
                         let tx = tx.clone();
@@ -271,23 +243,12 @@ impl OrderBookListener {
         } else {
             HashSet::new()
         };
-        EVENT_PROCESSING_LATENCY.with_label_values(&[source_label]).observe(process_start.elapsed().as_secs_f64());
 
         // Log HFT state progress periodically
         static HFT_STATE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let sc = HFT_STATE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if sc % 1000 == 0 {
             if let Some(state) = &mut self.order_book_state {
-                // Record health metrics
-                ORDERBOOK_HEIGHT.set(state.height() as i64);
-                ORDERBOOK_TIME_MS.set(state.time() as i64);
-                PENDING_ORDERS_CACHE.set(state.pending_order_statuses_count() as i64);
-                PENDING_DIFFS_CACHE.set(state.pending_new_diffs_count() as i64);
-
-                // Record orderbook stats
-                ORDERBOOK_ORDERS_TOTAL.set(state.order_count() as i64);
-                ORDERBOOK_COINS_COUNT.set(state.coin_count() as i64);
-
                 // Cleanup stale pending entries to prevent unbounded memory growth
                 state.cleanup_stale_pending();
 
@@ -305,7 +266,6 @@ impl OrderBookListener {
         // No throttle needed since we only compute BBO for changed coins (usually 1-2)
         if !changed_coins.is_empty() {
             if let Some(state) = &self.order_book_state {
-                let bbo_start = Instant::now();
                 let (time, bbos) = state.get_bbos_for_coins(&changed_coins);
                 if let Some(tx) = &self.internal_message_tx {
                     // Count fast BBO broadcasts
@@ -321,7 +281,6 @@ impl OrderBookListener {
                         drop(tx.send(msg));
                     });
                 }
-                BBO_BROADCAST_LATENCY.observe(bbo_start.elapsed().as_secs_f64());
             }
         }
 
@@ -332,7 +291,6 @@ impl OrderBookListener {
 
         if should_broadcast_l2 {
             if let Some(state) = &self.order_book_state {
-                let l2_start = Instant::now();
                 let (time, l2_snapshots) = state.l2_snapshots_uncached();
                 if let Some(tx) = &self.internal_message_tx {
                     self.last_l2_broadcast = Some(Instant::now());
@@ -350,7 +308,6 @@ impl OrderBookListener {
                         drop(tx.send(msg));
                     });
                 }
-                L2_BROADCAST_LATENCY.observe(l2_start.elapsed().as_secs_f64());
             }
         }
         Ok(())

@@ -1,6 +1,5 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 mod listeners;
-pub mod metrics;
 mod order_book;
 mod prelude;
 mod servers;
@@ -50,8 +49,6 @@ pub struct ServerConfig {
     pub snapshot_output_path: Option<PathBuf>,
     /// Path to visor_abci_state.json (optional)
     pub visor_state_path: Option<PathBuf>,
-    /// Port for Prometheus metrics endpoint (0 to disable)
-    pub metrics_port: u16,
     /// BBO-only mode: lightweight mode that only tracks best bid/ask per coin
     /// Disables L2/L4/Trades subscriptions but uses ~100MB RAM instead of 2-3GB
     pub bbo_only: bool,

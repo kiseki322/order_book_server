@@ -1,4 +1,3 @@
-use crate::metrics::WS_SUBSCRIPTIONS_ACTIVE;
 use crate::types::node_data::{NodeDataOrderDiff, NodeDataOrderStatus};
 use crate::types::{Bbo, L2Book, L4Book, Trade};
 use alloy::primitives::Address;
@@ -147,21 +146,11 @@ pub(crate) struct SubscriptionManager {
 
 impl SubscriptionManager {
     pub(crate) fn subscribe(&mut self, sub: Subscription) -> bool {
-        let label = sub.type_label().to_owned();
-        let inserted = self.subscriptions.insert(sub);
-        if inserted {
-            WS_SUBSCRIPTIONS_ACTIVE.with_label_values(&[&label]).inc();
-        }
-        inserted
+        self.subscriptions.insert(sub)
     }
 
     pub(crate) fn unsubscribe(&mut self, sub: Subscription) -> bool {
-        let label = sub.type_label().to_owned();
-        let removed = self.subscriptions.remove(&sub);
-        if removed {
-            WS_SUBSCRIPTIONS_ACTIVE.with_label_values(&[&label]).dec();
-        }
-        removed
+        self.subscriptions.remove(&sub)
     }
 
     pub(crate) const fn subscriptions(&self) -> &HashSet<Subscription> {
@@ -169,19 +158,10 @@ impl SubscriptionManager {
     }
 }
 
-impl Drop for SubscriptionManager {
-    fn drop(&mut self) {
-        for sub in &self.subscriptions {
-            WS_SUBSCRIPTIONS_ACTIVE.with_label_values(&[sub.type_label()]).dec();
-        }
-    }
-}
-
 #[cfg(test)]
 mod test {
-    use crate::types::subscription::Subscription;
-
     use super::{ClientMessage, ServerResponse};
+    use crate::types::subscription::Subscription;
 
     #[test]
     fn test_message_deserialization_subscription_response() {

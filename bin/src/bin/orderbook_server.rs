@@ -75,10 +75,6 @@ struct Args {
     #[arg(long)]
     visor_state_path: Option<PathBuf>,
 
-    /// Port for Prometheus metrics endpoint (0 to disable)
-    #[arg(long, default_value = "9090")]
-    metrics_port: u16,
-
     /// BBO-only mode: lightweight mode that only tracks best bid/ask per coin.
     /// Reduces RAM from 2-3GB to ~100MB. Disables L2/L4/Trades subscriptions.
     #[arg(long, default_value = "false")]
@@ -87,23 +83,6 @@ struct Args {
     /// Log level: error, warn, info, debug, trace
     #[arg(long, default_value = "info")]
     log_level: String,
-}
-
-/// Start the Prometheus metrics HTTP server
-async fn start_metrics_server(port: u16) {
-    use axum::{Router, response::IntoResponse, routing::get};
-
-    async fn metrics_handler() -> impl IntoResponse {
-        server::metrics::gather_metrics()
-    }
-
-    let app = Router::new().route("/metrics", get(metrics_handler));
-    let addr = format!("0.0.0.0:{}", port);
-
-    log::info!("Metrics server listening on http://{}/metrics", addr);
-
-    let listener = tokio::net::TcpListener::bind(&addr).await.expect("failed to bind metrics port");
-    axum::serve(listener, app).await.expect("metrics server failed");
 }
 
 #[tokio::main]
@@ -117,9 +96,6 @@ async fn main() -> Result<()> {
         std::env::set_var("RUST_LOG", &args.log_level);
     }
     env_logger::init();
-
-    // Register Prometheus metrics
-    server::metrics::register_metrics();
 
     let full_address = format!("{}:{}", args.address, args.port);
 
@@ -145,7 +121,6 @@ async fn main() -> Result<()> {
         abci_state_path: args.abci_state_path,
         snapshot_output_path: args.snapshot_output_path,
         visor_state_path: args.visor_state_path,
-        metrics_port: args.metrics_port,
         bbo_only: args.bbo_only,
     };
 
@@ -174,28 +149,8 @@ async fn main() -> Result<()> {
     if let Some(ref dir) = config.data_dir {
         println!("  Data dir: {}", dir.display());
     }
-    if config.metrics_port > 0 {
-        println!("  Metrics: http://0.0.0.0:{}/metrics", config.metrics_port);
-    }
     println!("  Log level: {}", args.log_level);
     println!();
-
-    // Spawn uptime counter
-    tokio::spawn(async {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-        loop {
-            interval.tick().await;
-            server::metrics::UPTIME_SECONDS.inc();
-        }
-    });
-
-    // Start metrics server if port > 0
-    if config.metrics_port > 0 {
-        let metrics_port = config.metrics_port;
-        tokio::spawn(async move {
-            start_metrics_server(metrics_port).await;
-        });
-    }
 
     tokio::select! {
         result = run_websocket_server(config) => {
