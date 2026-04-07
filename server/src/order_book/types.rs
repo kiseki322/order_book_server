@@ -1,7 +1,11 @@
-use crate::prelude::*;
+use std::{
+    fmt::{Debug, Formatter},
+    ops::Add,
+};
+
 use serde::{Deserialize, Serialize};
-use std::fmt::{Debug, Formatter};
-use std::ops::Add;
+
+use crate::prelude::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) enum Side {
@@ -54,6 +58,9 @@ impl Oid {
     pub(crate) const fn new(value: u64) -> Self {
         Self(value)
     }
+    pub(crate) const fn value(self) -> u64 {
+        self.0
+    }
 }
 
 pub(crate) trait InnerOrder: Clone {
@@ -77,20 +84,8 @@ impl Coin {
         self.0.clone()
     }
 
-    /// Returns true for spot markets: @ prefixed coins and PURR/USDC
     pub(crate) fn is_spot(&self) -> bool {
         self.0.starts_with('@') || self.0 == "PURR/USDC"
-    }
-
-    /// Returns true for HIP-3 markets: coins with colon format (X:Y)
-    /// Examples: flx:COIN, xyz:AMD, abc:XYZ
-    pub(crate) fn is_hip3(&self) -> bool {
-        self.0.contains(':')
-    }
-
-    /// Returns true for perpetual futures (not spot, not hip3)
-    pub(crate) fn is_perp(&self) -> bool {
-        !self.is_spot() && !self.is_hip3()
     }
 }
 

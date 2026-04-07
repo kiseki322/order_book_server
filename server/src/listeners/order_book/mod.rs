@@ -1,8 +1,32 @@
+use std::{
+    cmp::Ordering,
+    collections::{HashMap, HashSet, VecDeque},
+    io::{Read, Seek, SeekFrom},
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
+
+use alloy::primitives::Address;
+use fs::File;
+use log::{error, info};
+use notify::{Event, RecursiveMode, Watcher, recommended_watcher};
+use tokio::{
+    sync::{
+        Mutex,
+        broadcast::Sender,
+        mpsc::{UnboundedSender, unbounded_channel},
+    },
+    time::{Instant, interval_at, sleep},
+};
+use utils::{BatchQueue, EventBatch, process_rmp_file, validate_snapshot_consistency};
+
 use crate::{
-    listeners::order_book::state::OrderBookState,
+    HL_NODE,
+    listeners::{directory::DirectoryListener, order_book::state::OrderBookState},
     order_book::{
-        Coin, Px, Snapshot, Sz,
-        multi_book::{Snapshots, load_snapshots_from_cli_json},
+        Coin, Snapshot,
+        multi_book::{Snapshots, load_snapshots_from_json},
     },
     prelude::*,
     types::{
@@ -11,179 +35,437 @@ use crate::{
         node_data::{Batch, EventSource, NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
     },
 };
-use alloy::primitives::Address;
-use log::{error, info};
-use std::{
-    collections::{HashMap, HashSet, VecDeque},
-    sync::Arc,
-    time::Duration,
-};
-use tokio::{
-    sync::{
-        Mutex,
-        broadcast::Sender,
-        mpsc::{UnboundedSender, unbounded_channel},
-    },
-    time::{Instant, sleep},
-};
-use utils::{EventBatch, SnapshotConfig, get_visor_path, process_rmp_file};
 
-mod parallel;
 mod state;
 mod utils;
 
+// WARNING - this code assumes no other file system operations are occurring in the watched directories
+// if there are scripts running, this may not work as intended
+pub(crate) async fn hl_listen(
+    listener: Arc<Mutex<OrderBookListener>>,
+    dir: PathBuf,
+    inactivity_exit_secs: u64,
+) -> Result<()> {
+    let order_statuses_dir = EventSource::OrderStatuses.event_source_dir(&dir).canonicalize()?;
+    let fills_dir = EventSource::Fills.event_source_dir(&dir).canonicalize()?;
+    let order_diffs_dir = EventSource::OrderDiffs.event_source_dir(&dir).canonicalize()?;
+    info!("Monitoring order status directory: {}", order_statuses_dir.display());
+    info!("Monitoring order diffs directory: {}", order_diffs_dir.display());
+    info!("Monitoring fills directory: {}", fills_dir.display());
+
+    // monitoring the directory via the notify crate (gives file system events)
+    let (fs_event_tx, mut fs_event_rx) = unbounded_channel();
+    let mut watcher = recommended_watcher(move |res| {
+        let fs_event_tx = fs_event_tx.clone();
+        if let Err(err) = fs_event_tx.send(res) {
+            error!("Error sending fs event to processor via channel: {err}");
+        }
+    })?;
+
+    let ignore_spot = {
+        let listener = listener.lock().await;
+        listener.ignore_spot
+    };
+
+    // every so often, we fetch a new snapshot and the snapshot_fetch_task starts running.
+    // Result is sent back along this channel (if error, we want to return to top level)
+    let (snapshot_fetch_task_tx, mut snapshot_fetch_task_rx) = unbounded_channel::<Result<()>>();
+    let fetch_in_progress = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    watcher.watch(&order_statuses_dir, RecursiveMode::Recursive)?;
+    watcher.watch(&fills_dir, RecursiveMode::Recursive)?;
+    watcher.watch(&order_diffs_dir, RecursiveMode::Recursive)?;
+    let start = Instant::now() + Duration::from_secs(5);
+    let mut ticker = interval_at(start, Duration::from_secs(10));
+    loop {
+        tokio::select! {
+            event = fs_event_rx.recv() =>  match event {
+                Some(Ok(event)) => {
+                    if event.kind.is_create() || event.kind.is_modify() {
+                        let new_path = &event.paths[0];
+                        if new_path.starts_with(&order_statuses_dir) && new_path.is_file() {
+                            listener
+                                .lock()
+                                .await
+                                .process_update(&event, new_path, EventSource::OrderStatuses)
+                                .map_err(|err| format!("Order status processing error: {err}"))?;
+                        } else if new_path.starts_with(&fills_dir) && new_path.is_file() {
+                            listener
+                                .lock()
+                                .await
+                                .process_update(&event, new_path, EventSource::Fills)
+                                .map_err(|err| format!("Fill update processing error: {err}"))?;
+                        } else if new_path.starts_with(&order_diffs_dir) && new_path.is_file() {
+                            listener
+                                .lock()
+                                .await
+                                .process_update(&event, new_path, EventSource::OrderDiffs)
+                                .map_err(|err| format!("Book diff processing error: {err}"))?;
+                        }
+                    }
+                }
+                Some(Err(err)) => {
+                    error!("Watcher error: {err}");
+                    return Err(format!("Watcher error: {err}").into());
+                }
+                None => {
+                    error!("Channel closed. Listener exiting");
+                    return Err("Channel closed.".into());
+                }
+            },
+            snapshot_fetch_res = snapshot_fetch_task_rx.recv() => {
+                match snapshot_fetch_res {
+                    None => {
+                        return Err("Snapshot fetch task sender dropped".into());
+                    }
+                    Some(Err(err)) => {
+                        let is_initialized = listener.lock().await.is_ready();
+                        if is_initialized {
+                            // Already have a working order book — skip validation, don't crash
+                            error!("Snapshot validation error (non-fatal): {err}");
+                        } else {
+                            // Not yet initialized — log and wait for next tick to retry
+                            error!("Snapshot fetch error (will retry): {err}");
+                        }
+                    }
+                    Some(Ok(())) => {}
+                }
+            }
+            _ = ticker.tick() => {
+                if !fetch_in_progress.load(std::sync::atomic::Ordering::Relaxed) {
+                    let listener = listener.clone();
+                    let snapshot_fetch_task_tx = snapshot_fetch_task_tx.clone();
+                    let fetch_in_progress = fetch_in_progress.clone();
+                    fetch_in_progress.store(true, std::sync::atomic::Ordering::Relaxed);
+                    fetch_snapshot(dir.clone(), listener, snapshot_fetch_task_tx, ignore_spot, fetch_in_progress);
+                }
+            }
+            () = sleep(Duration::from_secs(inactivity_exit_secs)) => {
+                let listener = listener.lock().await;
+                if listener.is_ready() {
+                    return Err(format!("Stream has fallen behind ({HL_NODE} failed?)").into());
+                }
+            }
+        }
+    }
+}
+
 fn fetch_snapshot(
-    snapshot_config: SnapshotConfig,
+    dir: PathBuf,
     listener: Arc<Mutex<OrderBookListener>>,
     tx: UnboundedSender<Result<()>>,
-    _ignore_spot: bool,
+    ignore_spot: bool,
+    fetch_in_progress: Arc<std::sync::atomic::AtomicBool>,
 ) {
+    let tx = tx.clone();
     tokio::spawn(async move {
-        {
-            let mut listener = listener.lock().await;
-            listener.begin_caching();
-        }
-
-        let visor_path = get_visor_path(&snapshot_config);
-        let res = match process_rmp_file(&snapshot_config).await {
+        let res = match process_rmp_file(&dir).await {
             Ok(output_fln) => {
-                let snapshot =
-                    load_snapshots_from_cli_json::<InnerL4Order, (Address, L4Order)>(&output_fln, &visor_path).await;
+                let state = {
+                    let mut listener = listener.lock().await;
+                    listener.begin_caching();
+                    listener.clone_state()
+                };
+                let snapshot = load_snapshots_from_json::<InnerL4Order, (Address, L4Order)>(&output_fln).await;
                 info!("Snapshot fetched");
+                // sleep to let some updates build up.
                 sleep(Duration::from_secs(1)).await;
-
+                let mut cache = {
+                    let mut listener = listener.lock().await;
+                    listener.take_cache()
+                };
+                info!("Cache has {} elements", cache.len());
                 match snapshot {
                     Ok((height, expected_snapshot)) => {
-                        info!("Snapshot loaded at height {}", height);
-                        let mut listener = listener.lock().await;
-                        let _cache = listener.take_cache();
-                        listener.init_from_snapshot(expected_snapshot, height);
-                        Ok(())
+                        if let Some(mut state) = state {
+                            while state.height() < height {
+                                if let Some((order_statuses, order_diffs)) = cache.pop_front() {
+                                    state.apply_updates(order_statuses, order_diffs)?;
+                                } else {
+                                    return Err::<(), Error>("Not enough cached updates".into());
+                                }
+                            }
+                            if state.height() > height {
+                                return Err("Fetched snapshot lagging stored state".into());
+                            }
+                            let stored_snapshot = state.compute_snapshot().snapshot;
+                            info!("Validating snapshot");
+                            validate_snapshot_consistency(&stored_snapshot, expected_snapshot, ignore_spot)
+                        } else {
+                            listener.lock().await.init_from_snapshot(expected_snapshot, height);
+                            Ok(())
+                        }
                     }
                     Err(err) => Err(err),
                 }
             }
             Err(err) => Err(err),
         };
-        let _ = tx.send(res);
+        let _unused = tx.send(res);
+        fetch_in_progress.store(false, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
     });
 }
 
 pub(crate) struct OrderBookListener {
     ignore_spot: bool,
+    fill_status_file: Option<File>,
+    order_status_file: Option<File>,
+    order_diff_file: Option<File>,
+    // None if we haven't seen a valid snapshot yet
     order_book_state: Option<OrderBookState>,
+    last_fill: Option<u64>,
+    order_diff_cache: BatchQueue<NodeDataOrderDiff>,
+    order_status_cache: BatchQueue<NodeDataOrderStatus>,
+    // Only Some when we want it to collect updates
     fetched_snapshot_cache: Option<VecDeque<(Batch<NodeDataOrderStatus>, Batch<NodeDataOrderDiff>)>>,
     internal_message_tx: Option<Sender<Arc<InternalMessage>>>,
-    last_l2_broadcast: Option<Instant>,
+
+    last_snapshot_sent: Instant,
 }
 
 impl OrderBookListener {
-    pub(crate) const fn new(internal_message_tx: Option<Sender<Arc<InternalMessage>>>, ignore_spot: bool) -> Self {
+    pub(crate) fn new(internal_message_tx: Option<Sender<Arc<InternalMessage>>>, ignore_spot: bool) -> Self {
         Self {
             ignore_spot,
+            fill_status_file: None,
+            order_status_file: None,
+            order_diff_file: None,
             order_book_state: None,
+            last_fill: None,
             fetched_snapshot_cache: None,
             internal_message_tx,
-            last_l2_broadcast: None,
+            order_diff_cache: BatchQueue::new(),
+            order_status_cache: BatchQueue::new(),
+            last_snapshot_sent: Instant::now(),
         }
+    }
+
+    fn clone_state(&self) -> Option<OrderBookState> {
+        self.order_book_state.clone()
     }
 
     pub(crate) const fn is_ready(&self) -> bool {
         self.order_book_state.is_some()
     }
 
-    pub(crate) fn universe(&self) -> HashSet<Coin> {
-        self.order_book_state.as_ref().map_or_else(HashSet::new, OrderBookState::compute_universe)
+    pub(crate) fn universe(&mut self) -> HashSet<Coin> {
+        self.order_book_state.as_mut().map_or_else(HashSet::new, |s| s.compute_universe())
+    }
+
+    #[allow(clippy::type_complexity)]
+    // pops earliest pair of cached updates that have the same timestamp if possible
+    fn pop_cache(&mut self) -> Option<(Batch<NodeDataOrderStatus>, Batch<NodeDataOrderDiff>)> {
+        // synchronize to same block
+        while let Some(t) = self.order_diff_cache.front() {
+            if let Some(s) = self.order_status_cache.front() {
+                match t.block_number().cmp(&s.block_number()) {
+                    Ordering::Less => {
+                        self.order_diff_cache.pop_front();
+                    }
+                    Ordering::Equal => {
+                        return self
+                            .order_status_cache
+                            .pop_front()
+                            .and_then(|t| self.order_diff_cache.pop_front().map(|s| (t, s)));
+                    }
+                    Ordering::Greater => {
+                        self.order_status_cache.pop_front();
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+        None
+    }
+
+    fn receive_batch(&mut self, updates: EventBatch) -> Result<()> {
+        match updates {
+            EventBatch::Orders(batch) => {
+                self.order_status_cache.push(batch);
+            }
+            EventBatch::BookDiffs(batch) => {
+                self.order_diff_cache.push(batch);
+            }
+            EventBatch::Fills(batch) => {
+                if self.last_fill.is_none_or(|height| height < batch.block_number()) {
+                    if let Some(tx) = &self.internal_message_tx {
+                        let msg = Arc::new(InternalMessage::Fills { batch });
+                        let _unused = tx.send(msg);
+                    }
+                }
+            }
+        }
+        if self.is_ready()
+            && let Some((order_statuses, order_diffs)) = self.pop_cache()
+        {
+            self.order_book_state
+                .as_mut()
+                .map(|book| book.apply_updates(order_statuses.clone(), order_diffs.clone()))
+                .transpose()?;
+
+            if let Some(cache) = &mut self.fetched_snapshot_cache {
+                cache.push_back((order_statuses.clone(), order_diffs.clone()));
+            }
+
+            if let Some(tx) = &self.internal_message_tx {
+                let updates =
+                    Arc::new(InternalMessage::L4BookUpdates { diff_batch: order_diffs, status_batch: order_statuses });
+                let _unused = tx.send(updates);
+            }
+        }
+        Ok(())
     }
 
     fn begin_caching(&mut self) {
         self.fetched_snapshot_cache = Some(VecDeque::new());
     }
 
+    // tkae the cached updates and stop collecting updates
     fn take_cache(&mut self) -> VecDeque<(Batch<NodeDataOrderStatus>, Batch<NodeDataOrderDiff>)> {
         self.fetched_snapshot_cache.take().unwrap_or_default()
     }
 
     fn init_from_snapshot(&mut self, snapshot: Snapshots<InnerL4Order>, height: u64) {
-        let new_order_book = OrderBookState::from_snapshot(snapshot, height, 0, true, self.ignore_spot);
-        self.order_book_state = Some(new_order_book);
-        self.fetched_snapshot_cache = None;
-        info!("Order book ready at height {}", height);
+        info!("No existing snapshot");
+        let mut new_order_book = OrderBookState::from_snapshot(snapshot, height, 0, true, self.ignore_spot);
+        let mut retry = false;
+        while let Some((order_statuses, order_diffs)) = self.pop_cache() {
+            if new_order_book.apply_updates(order_statuses, order_diffs).is_err() {
+                info!(
+                    "Failed to apply updates to this book (likely missing older updates). Waiting for next snapshot."
+                );
+                retry = true;
+                break;
+            }
+        }
+        if !retry {
+            self.order_book_state = Some(new_order_book);
+            info!("Order book ready");
+        }
     }
 
+    // forcibly grab current snapshot
     pub(crate) fn compute_snapshot(&mut self) -> Option<TimedSnapshots> {
         self.order_book_state.as_mut().map(|o| o.compute_snapshot())
     }
 
-    #[inline(always)]
-    fn should_broadcast_l2(&self) -> bool {
-        self.last_l2_broadcast.map(|t| t.elapsed() >= Duration::from_millis(10)).unwrap_or(true)
+    // prevent snapshotting mutiple times at the same height
+    fn l2_snapshots(&mut self, prevent_future_snaps: bool) -> Option<(u64, L2Snapshots)> {
+        self.order_book_state.as_mut().and_then(|o| o.l2_snapshots(prevent_future_snaps))
+    }
+}
+
+impl OrderBookListener {
+    fn process_update(&mut self, event: &Event, new_path: &PathBuf, event_source: EventSource) -> Result<()> {
+        if event.kind.is_create() {
+            info!("-- Event: {} created --", new_path.display());
+            self.on_file_creation(new_path.clone(), event_source)?;
+        }
+        // Check for `Modify` event (only if the file is already initialized)
+        else {
+            // If we are not tracking anything right now, we treat a file update as declaring that it has been created.
+            // Unfortunately, we miss the update that occurs at this time step.
+            // We go to the end of the file to read for updates after that.
+            if self.is_reading(event_source) {
+                self.on_file_modification(event_source)?;
+            } else {
+                info!("-- Event: {} modified, tracking it now --", new_path.display());
+                let file = self.file_mut(event_source);
+                let mut new_file = File::open(new_path)?;
+                new_file.seek(SeekFrom::End(0))?;
+                *file = Some(new_file);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl DirectoryListener for OrderBookListener {
+    fn is_reading(&self, event_source: EventSource) -> bool {
+        match event_source {
+            EventSource::Fills => self.fill_status_file.is_some(),
+            EventSource::OrderStatuses => self.order_status_file.is_some(),
+            EventSource::OrderDiffs => self.order_diff_file.is_some(),
+        }
     }
 
-    pub(crate) fn process_data_hft(&mut self, line: String, event_source: EventSource) -> Result<()> {
-        if line.is_empty() {
-            return Ok(());
+    fn file_mut(&mut self, event_source: EventSource) -> &mut Option<File> {
+        match event_source {
+            EventSource::Fills => &mut self.fill_status_file,
+            EventSource::OrderStatuses => &mut self.order_status_file,
+            EventSource::OrderDiffs => &mut self.order_diff_file,
         }
+    }
 
-        let event_batch = match event_source {
-            EventSource::Fills => {
-                let batch = sonic_rs::from_str::<Batch<NodeDataFill>>(&line)?;
-                EventBatch::Fills(batch)
-            }
-            EventSource::OrderStatuses => {
-                let batch = sonic_rs::from_str::<Batch<NodeDataOrderStatus>>(&line)?;
-                EventBatch::Orders(batch)
-            }
-            EventSource::OrderDiffs => {
-                let batch = sonic_rs::from_str::<Batch<NodeDataOrderDiff>>(&line)?;
-                EventBatch::BookDiffs(batch)
-            }
-        };
-
-        let changed_coins = if let Some(state) = self.order_book_state.as_mut() {
-            match event_batch {
-                EventBatch::Orders(batch) => {
-                    if let Some(tx) = &self.internal_message_tx {
-                        let _ = tx.send(Arc::new(InternalMessage::L4OrderStatuses { batch: batch.clone() }));
-                    }
-                    state.apply_order_statuses_hft(batch)?
-                }
-                EventBatch::BookDiffs(batch) => {
-                    if let Some(tx) = &self.internal_message_tx {
-                        let _ = tx.send(Arc::new(InternalMessage::L4OrderDiffs { batch: batch.clone() }));
-                    }
-                    state.apply_order_diffs_hft(batch)?
-                }
-                EventBatch::Fills(batch) => {
-                    if let Some(tx) = &self.internal_message_tx {
-                        let _ = tx.send(Arc::new(InternalMessage::Fills { batch }));
-                    }
-                    HashSet::new()
-                }
-            }
-        } else {
-            HashSet::new()
-        };
-
-        if !changed_coins.is_empty() {
-            if let Some(state) = &self.order_book_state {
-                let (time, bbos) = state.get_bbos_for_coins(&changed_coins);
-                if let Some(tx) = &self.internal_message_tx {
-                    let _ = tx.send(Arc::new(InternalMessage::BboUpdate { bbos, time }));
-                }
+    fn on_file_creation(&mut self, new_file: PathBuf, event_source: EventSource) -> Result<()> {
+        if let Some(file) = self.file_mut(event_source).as_mut() {
+            let mut buf = String::new();
+            file.read_to_string(&mut buf)?;
+            if !buf.is_empty() {
+                self.process_data(buf, event_source)?;
             }
         }
+        *self.file_mut(event_source) = Some(File::open(new_file)?);
+        Ok(())
+    }
 
-        if self.should_broadcast_l2() {
-            if let Some(state) = &self.order_book_state {
-                let (time, l2_snapshots) = state.l2_snapshots_uncached();
-                if let Some(tx) = &self.internal_message_tx {
-                    self.last_l2_broadcast = Some(Instant::now());
-                    let _ = tx.send(Arc::new(InternalMessage::Snapshot { l2_snapshots, time }));
+    fn process_data(&mut self, data: String, event_source: EventSource) -> Result<()> {
+        let total_len = data.len();
+        let lines = data.lines();
+        for line in lines {
+            if line.is_empty() {
+                continue;
+            }
+            let res = match event_source {
+                EventSource::Fills => sonic_rs::from_str::<Batch<NodeDataFill>>(line).map(|batch| {
+                    let height = batch.block_number();
+                    (height, EventBatch::Fills(batch))
+                }),
+                EventSource::OrderStatuses => sonic_rs::from_str::<Batch<NodeDataOrderStatus>>(line)
+                    .map(|batch| (batch.block_number(), EventBatch::Orders(batch))),
+                EventSource::OrderDiffs => sonic_rs::from_str::<Batch<NodeDataOrderDiff>>(line)
+                    .map(|batch| (batch.block_number(), EventBatch::BookDiffs(batch))),
+            };
+            let (height, event_batch) = match res {
+                Ok(data) => data,
+                Err(err) => {
+                    // Build a safe preview of the line (up to 100 *characters*).
+                    let preview: String = line.chars().take(100).collect();
+
+                    // if we run into a serialization error (hitting EOF), just return to last line.
+                    error!(
+                        "{event_source} serialization error {err}, height: {:?}, line: {:?}",
+                        self.order_book_state.as_ref().map(OrderBookState::height),
+                        preview,
+                    );
+                    #[allow(clippy::unwrap_used)]
+                    let total_len: i64 = total_len.try_into().unwrap();
+                    self.file_mut(event_source).as_mut().map(|f| f.seek_relative(-total_len));
+                    break;
                 }
+            };
+            if height % 100 == 0 {
+                info!("{event_source} block: {height}");
+            }
+            if let Err(err) = self.receive_batch(event_batch) {
+                self.order_book_state = None;
+                return Err(err);
             }
         }
-
+        let now = Instant::now();
+        if now.duration_since(self.last_snapshot_sent) >= Duration::from_millis(500) {
+            let snapshot = self.l2_snapshots(true);
+            if let Some(snapshot) = snapshot
+                && let Some(tx) = &self.internal_message_tx
+            {
+                let tx = tx.clone();
+                let msg = Arc::new(InternalMessage::Snapshot { l2_snapshots: snapshot.1, time: snapshot.0 });
+                let _unused = tx.send(msg);
+                self.last_snapshot_sent = now;
+            }
+        }
         Ok(())
     }
 }
@@ -202,74 +484,15 @@ pub(crate) struct TimedSnapshots {
     pub(crate) snapshot: Snapshots<InnerL4Order>,
 }
 
+// Messages sent from node data listener to websocket dispatch to support streaming
 pub(crate) enum InternalMessage {
     Snapshot { l2_snapshots: L2Snapshots, time: u64 },
     Fills { batch: Batch<NodeDataFill> },
-    BboUpdate { bbos: HashMap<Coin, (Option<(Px, Sz, u32)>, Option<(Px, Sz, u32)>)>, time: u64 },
-    L4OrderDiffs { batch: Batch<NodeDataOrderDiff> },
-    L4OrderStatuses { batch: Batch<NodeDataOrderStatus> },
+    L4BookUpdates { diff_batch: Batch<NodeDataOrderDiff>, status_batch: Batch<NodeDataOrderStatus> },
 }
 
 #[derive(Eq, PartialEq, Hash)]
 pub(crate) struct L2SnapshotParams {
     n_sig_figs: Option<u32>,
     mantissa: Option<u64>,
-}
-
-pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, config: crate::ServerConfig) -> Result<()> {
-    let dir = config.data_dir.clone().unwrap_or_else(|| dirs::home_dir().expect("Could not find home directory"));
-
-    let snapshot_config = SnapshotConfig {
-        mode: config.snapshot_mode,
-        docker_container: config.docker_container.clone(),
-        hlnode_binary: config.hlnode_binary.clone(),
-        abci_state_path: config.abci_state_path.clone(),
-        snapshot_output_path: config.snapshot_output_path.clone(),
-        visor_state_path: config.visor_state_path.clone(),
-        data_dir: dir.clone(),
-    };
-
-    let ignore_spot = listener.lock().await.ignore_spot;
-    let (crossbeam_rx, _handles, _, _, _) = parallel::start_parallel_file_watchers(dir);
-    let (tokio_tx, mut tokio_rx) = unbounded_channel::<parallel::FileEvent>();
-
-    tokio::task::spawn_blocking(move || {
-        while let Ok(event) = crossbeam_rx.recv() {
-            if tokio_tx.send(event).is_err() {
-                break;
-            }
-        }
-    });
-
-    let (snapshot_fetch_task_tx, mut snapshot_fetch_task_rx) = unbounded_channel::<Result<()>>();
-    let mut ticker = tokio::time::interval_at(Instant::now() + Duration::from_secs(5), Duration::from_secs(10));
-    let mut snapshot_fetch_pending = false;
-
-    loop {
-        tokio::select! {
-            biased;
-            Some(event) = tokio_rx.recv() => {
-                let mut lock = listener.lock().await;
-                let result = match event {
-                    parallel::FileEvent::OrderDiff(line) => lock.process_data_hft(line, EventSource::OrderDiffs),
-                    parallel::FileEvent::OrderStatus(line) => lock.process_data_hft(line, EventSource::OrderStatuses),
-                    parallel::FileEvent::Fill(line) => lock.process_data_hft(line, EventSource::Fills),
-                };
-                if let Err(err) = result {
-                    error!("HFT process error: {err}");
-                }
-            }
-            res = snapshot_fetch_task_rx.recv() => {
-                snapshot_fetch_pending = false;
-                if let Some(Err(err)) = res { return Err(err); }
-            }
-            _ = ticker.tick() => {
-                let is_ready = listener.lock().await.is_ready();
-                if !is_ready && !snapshot_fetch_pending {
-                    snapshot_fetch_pending = true;
-                    fetch_snapshot(snapshot_config.clone(), listener.clone(), snapshot_fetch_task_tx.clone(), ignore_spot);
-                }
-            }
-        }
-    }
 }

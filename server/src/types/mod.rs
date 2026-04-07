@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use alloy::primitives::Address;
 use serde::{Deserialize, Serialize};
 
@@ -10,7 +12,7 @@ pub(crate) mod inner;
 pub(crate) mod node_data;
 pub(crate) mod subscription;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct Trade {
     pub coin: String,
     side: Side,
@@ -19,10 +21,10 @@ pub(crate) struct Trade {
     hash: String,
     time: u64,
     tid: u64,
-    user: Address,
+    users: [Address; 2],
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Level {
     px: String,
     sz: String,
@@ -33,27 +35,12 @@ impl Level {
     pub(crate) const fn new(px: String, sz: String, n: usize) -> Self {
         Self { px, sz, n }
     }
-
-    pub(crate) fn px(&self) -> &str {
-        &self.px
-    }
-
-    pub(crate) fn sz(&self) -> &str {
-        &self.sz
-    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub(crate) struct L2Book {
     coin: String,
     time: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    n_sig_figs: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    mantissa: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    n_levels: Option<usize>,
     levels: [Vec<Level>; 2],
 }
 
@@ -63,46 +50,33 @@ pub(crate) enum L4Book {
     Updates(L4BookUpdates),
 }
 
-/// Best Bid/Offer - top of book only
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct Bbo {
-    pub coin: String,
-    pub time: u64,
-    pub bid: Option<Level>,
-    pub ask: Option<Level>,
-}
-
 impl L2Book {
-    pub(crate) const fn from_l2_snapshot(
-        coin: String,
-        snapshot: [Vec<Level>; 2],
-        time: u64,
-        n_sig_figs: Option<u32>,
-        mantissa: Option<u64>,
-        n_levels: Option<usize>,
-    ) -> Self {
-        Self { coin, time, n_sig_figs, mantissa, n_levels, levels: snapshot }
+    pub(crate) const fn from_l2_snapshot(coin: String, snapshot: [Vec<Level>; 2], time: u64) -> Self {
+        Self { coin, time, levels: snapshot }
     }
 }
 
 impl Trade {
-    /// Create a trade from a single fill (raw broadcast without pairing)
-    pub(crate) fn from_single_fill(fill: NodeDataFill) -> Self {
-        let NodeDataFill(user, fill_data) = fill;
-        Self {
-            coin: fill_data.coin,
-            side: fill_data.side,
-            px: fill_data.px,
-            sz: fill_data.sz,
-            hash: fill_data.hash,
-            time: fill_data.time,
-            tid: fill_data.tid,
-            user,
-        }
+    #[allow(clippy::unwrap_used)]
+    pub(crate) fn from_fills(mut fills: HashMap<Side, NodeDataFill>) -> Self {
+        let NodeDataFill(seller, ask_fill) = fills.remove(&Side::Ask).unwrap();
+        let NodeDataFill(buyer, bid_fill) = fills.remove(&Side::Bid).unwrap();
+        let ask_is_taker = ask_fill.crossed;
+        let side = if ask_is_taker { Side::Ask } else { Side::Bid };
+        let coin = ask_fill.coin.clone();
+        assert_eq!(coin, bid_fill.coin);
+        let tid = ask_fill.tid;
+        assert_eq!(tid, bid_fill.tid);
+        let px = ask_fill.px;
+        let sz = ask_fill.sz;
+        let hash = ask_fill.hash;
+        let time = ask_fill.time;
+        let users = [buyer, seller];
+        Self { coin, side, px, sz, hash, time, tid, users }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct L4BookUpdates {
     pub time: u64,
     pub height: u64,
@@ -132,19 +106,15 @@ pub(crate) struct L4Order {
     pub trigger_condition: String,
     pub is_trigger: bool,
     pub trigger_px: String,
-    #[serde(default)]
-    pub children: Vec<serde_json::Value>,
     pub is_position_tpsl: bool,
     pub reduce_only: bool,
     pub order_type: String,
-    #[serde(default)]
-    pub orig_sz: String,
     pub tif: Option<String>,
     pub cloid: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "camelCase")]
 pub(crate) enum OrderDiff {
     #[serde(rename_all = "camelCase")]
     New {
@@ -174,18 +144,14 @@ pub(crate) struct Fill {
     pub crossed: bool,
     pub fee: String,
     pub tid: u64,
-    #[serde(default)]
-    pub cloid: Option<String>,
     pub fee_token: String,
-    #[serde(default)]
-    pub twap_id: Option<u64>,
     pub liquidation: Option<Liquidation>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Liquidation {
-    pub liquidated_user: String,
-    pub mark_px: String,
-    pub method: String,
+    liquidated_user: String,
+    mark_px: String,
+    method: String,
 }

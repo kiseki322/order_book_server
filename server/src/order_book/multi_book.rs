@@ -1,20 +1,26 @@
-use crate::{
-    order_book::{Coin, InnerOrder, Oid, OrderBook, Px, Snapshot, Sz},
-    prelude::*,
-};
-use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
-use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap},
     path::Path,
 };
+
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+use serde::{Deserialize, Serialize};
 use tokio::fs::read_to_string;
+
+use crate::{
+    order_book::{Coin, InnerOrder, Oid, OrderBook, Snapshot, Sz},
+    prelude::*,
+};
 
 pub(crate) struct Snapshots<O>(HashMap<Coin, Snapshot<O>>);
 
 impl<O> Snapshots<O> {
     pub(crate) const fn new(value: HashMap<Coin, Snapshot<O>>) -> Self {
         Self(value)
+    }
+
+    pub(crate) const fn as_ref(&self) -> &HashMap<Coin, Snapshot<O>> {
+        &self.0
     }
 
     pub(crate) fn value(self) -> HashMap<Coin, Snapshot<O>> {
@@ -31,7 +37,6 @@ impl<O: InnerOrder> OrderBooks<O> {
     pub(crate) const fn as_ref(&self) -> &BTreeMap<Coin, OrderBook<O>> {
         &self.order_books
     }
-
     #[must_use]
     pub(crate) fn from_snapshots(snapshot: Snapshots<O>, ignore_triggers: bool) -> Self {
         Self {
@@ -49,28 +54,12 @@ impl<O: InnerOrder> OrderBooks<O> {
     }
 
     pub(crate) fn cancel_order(&mut self, oid: Oid, coin: Coin) -> bool {
-        if let Some(book) = self.order_books.get_mut(&coin) {
-            let success = book.cancel_order(oid.clone());
-            if !success {
-                log::debug!("cancel_order: oid {:?} not found in {:?} book", oid, coin);
-            }
-            success
-        } else {
-            log::debug!("cancel_order: no book for coin {:?}", coin);
-            false
-        }
+        self.order_books.get_mut(&coin).is_some_and(|book| book.cancel_order(oid))
     }
 
+    // change size to reflect how much gets matched during the block
     pub(crate) fn modify_sz(&mut self, oid: Oid, coin: Coin, sz: Sz) -> bool {
         self.order_books.get_mut(&coin).is_some_and(|book| book.modify_sz(oid, sz))
-    }
-
-    #[must_use]
-    pub(crate) fn get_bbos_for_coins(
-        &self,
-        coins: &HashSet<Coin>,
-    ) -> HashMap<Coin, (Option<(Px, Sz, u32)>, Option<(Px, Sz, u32)>)> {
-        coins.iter().filter_map(|coin| self.order_books.get(coin).map(|book| (coin.clone(), book.get_bbo()))).collect()
     }
 }
 
@@ -82,13 +71,13 @@ impl<O: Send + Sync + InnerOrder> OrderBooks<O> {
     }
 }
 
-pub(crate) fn load_snapshots_from_cli_str<O, R>(str: &str, height: u64) -> Result<(u64, Snapshots<O>)>
+pub(crate) fn load_snapshots_from_str<O, R>(str: &str) -> Result<(u64, Snapshots<O>)>
 where
     O: TryFrom<R, Error = Error>,
     R: Serialize + for<'a> Deserialize<'a>,
 {
     #[allow(clippy::type_complexity)]
-    let snapshot: Vec<(String, [Vec<R>; 2])> = serde_json::from_str(str)?;
+    let (height, snapshot): (u64, Vec<(String, [Vec<R>; 2])>) = sonic_rs::from_str(str)?;
     Ok((
         height,
         Snapshots::new(
@@ -104,70 +93,35 @@ where
     ))
 }
 
-pub(crate) async fn load_snapshots_from_cli_json<O, R>(
-    snapshot_path: &Path,
-    visor_state_path: &Path,
-) -> Result<(u64, Snapshots<O>)>
+pub(crate) async fn load_snapshots_from_json<O, R>(path: &Path) -> Result<(u64, Snapshots<O>)>
 where
     O: TryFrom<R, Error = Error>,
     R: Serialize + for<'a> Deserialize<'a>,
 {
-    let visor_state = read_to_string(visor_state_path).await?;
-    let visor: serde_json::Value = serde_json::from_str(&visor_state)?;
-    let height = visor["height"].as_u64().ok_or("Missing height in visor state")?;
-
-    let file_contents = read_to_string(snapshot_path).await?;
-    load_snapshots_from_cli_str(&file_contents, height)
+    let file_contents = read_to_string(path).await?;
+    load_snapshots_from_str(&file_contents)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::fs::create_dir_all;
+
+    use alloy::primitives::Address;
+    use itertools::Itertools;
+    use tempfile::tempdir;
+
     use crate::{
         order_book::{
             InnerOrder, OrderBook, Px, Side, Snapshot, Sz,
             levels::build_l2_level,
-            multi_book::{Coin, Snapshots},
+            multi_book::{Coin, Snapshots, load_snapshots_from_json, load_snapshots_from_str},
         },
+        prelude::*,
         types::{
             L4Order, Level,
             inner::{InnerL4Order, InnerLevel},
         },
     };
-    use alloy::primitives::Address;
-    use itertools::Itertools;
-    use std::{fs::create_dir_all, path::PathBuf};
-
-    fn load_snapshots_from_str<O, R>(str: &str) -> Result<(u64, Snapshots<O>)>
-    where
-        O: TryFrom<R, Error = Error>,
-        R: Serialize + for<'a> Deserialize<'a>,
-    {
-        #[allow(clippy::type_complexity)]
-        let (height, snapshot): (u64, Vec<(String, [Vec<R>; 2])>) = serde_json::from_str(str)?;
-        Ok((
-            height,
-            Snapshots::new(
-                snapshot
-                    .into_iter()
-                    .map(|(coin, [bids, asks])| {
-                        let bids: Vec<O> = bids.into_iter().map(O::try_from).collect::<Result<Vec<O>>>()?;
-                        let asks: Vec<O> = asks.into_iter().map(O::try_from).collect::<Result<Vec<O>>>()?;
-                        Ok((Coin::new(&coin), Snapshot([bids, asks])))
-                    })
-                    .collect::<Result<HashMap<Coin, Snapshot<O>>>>()?,
-            ),
-        ))
-    }
-
-    async fn load_snapshots_from_json<O, R>(path: &PathBuf) -> Result<(u64, Snapshots<O>)>
-    where
-        O: TryFrom<R, Error = Error>,
-        R: Serialize + for<'a> Deserialize<'a>,
-    {
-        let file_contents = read_to_string(path).await?;
-        load_snapshots_from_str(&file_contents)
-    }
 
     #[must_use]
     fn snapshot_to_l2_snapshot<O: InnerOrder>(
@@ -325,12 +279,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_deserialization_from_json() -> Result<()> {
-        create_dir_all("tmp/deserialization_test")?;
-        std::fs::write("tmp/deserialization_test/out.json", SNAPSHOT_JSON)?;
-        load_snapshots_from_json::<InnerL4Order, (Address, L4Order)>(&PathBuf::from(
-            "tmp/deserialization_test/out.json",
-        ))
-        .await?;
+        let temp_dir = tempdir()?;
+        let test_dir = temp_dir.path().join("deserialization_test");
+        create_dir_all(&test_dir)?;
+        let snapshot_path = test_dir.join("out.json");
+        fs::write(&snapshot_path, SNAPSHOT_JSON)?;
+        load_snapshots_from_json::<InnerL4Order, (Address, L4Order)>(&snapshot_path).await?;
         Ok(())
     }
 

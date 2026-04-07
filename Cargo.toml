@@ -1,5 +1,5 @@
 [workspace]
-members = ["server", "bin"]
+members = ["server", "binaries"]
 
 resolver = "3"
 
@@ -51,7 +51,7 @@ ffi_unwind_calls                              = { level = "warn" }
 keyword-idents                                = { level = "warn" }
 keyword_idents_2018                           = { level = "warn" }
 keyword_idents_2024                           = { level = "warn" }
-let_underscore_drop                           = { level = "allow" }
+let_underscore_drop                           = { level = "warn" }
 macro_use_extern_crate                        = { level = "warn" }
 missing_abi                                   = { level = "warn" }
 non_ascii_idents                              = { level = "warn" }

@@ -1,95 +1,177 @@
+use std::{
+    collections::{HashMap, VecDeque},
+    path::{Path, PathBuf},
+};
+
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+use reqwest::Client;
+use serde_json::json;
+
 use crate::{
-    SnapshotMode,
     listeners::order_book::{L2SnapshotParams, L2Snapshots},
-    order_book::{multi_book::OrderBooks, types::InnerOrder},
+    order_book::{
+        multi_book::{OrderBooks, Snapshots},
+        types::InnerOrder,
+    },
     prelude::*,
     types::node_data::{Batch, NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
 };
-use log::{error, info};
-use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
-use std::{collections::HashMap, fs, path::PathBuf};
-use tokio::process::Command;
+use log::info;
+use tokio::fs;
 
-#[derive(Debug, Clone)]
-pub(super) struct SnapshotConfig {
-    pub mode: SnapshotMode,
-    pub docker_container: String,
-    pub hlnode_binary: String,
-    pub abci_state_path: Option<PathBuf>,
-    pub snapshot_output_path: Option<PathBuf>,
-    pub visor_state_path: Option<PathBuf>,
-    pub data_dir: PathBuf,
+/// Fetches an L4 snapshot and writes it to `out.json`.
+///
+/// First attempts the `fileSnapshot` API. The output path for the API is set
+/// inside `hl/` (the shared volume) so the node process can write it and the
+/// order book server can read it — important when running in separate containers.
+///
+/// If the API fails, falls back to reading the latest periodic ABCI state file
+/// and computing L4 snapshots via `hl-node compute-l4-snapshots`. The fallback
+/// requires `hl-node` on PATH (or via `HL_NODE_PATH` env var).
+pub(super) async fn process_rmp_file(dir: &Path) -> Result<PathBuf> {
+    // API: write into the shared volume so the node and OBS can both access it
+    let api_output_path = dir.join("hl/out.json");
+    // CLI: write to local filesystem (OBS runs hl-node as a subprocess)
+    let cli_output_path = dir.join("out.json");
+
+    match process_via_api(&api_output_path).await {
+        Ok(()) => return Ok(api_output_path),
+        Err(err) => {
+            info!("fileSnapshot API unavailable ({err}), trying periodic ABCI state fallback");
+        }
+    }
+
+    process_via_cli(dir, &cli_output_path).await?;
+    Ok(cli_output_path)
 }
 
-async fn run_hl_node_cmd(cmd: &mut Command) -> Result<()> {
-    let output = cmd.output().await?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        error!("hl-node command failed.\nSTDOUT: {}\nSTDERR: {}", stdout, stderr);
-        return Err("hl-node execution failed".into());
-    }
+async fn process_via_api(output_path: &Path) -> Result<()> {
+    let payload = json!({
+        "type": "fileSnapshot",
+        "request": {
+            "type": "l4Snapshots",
+            "includeUsers": true,
+            "includeTriggerOrders": false
+        },
+        "outPath": output_path,
+        "includeHeightInOutput": true
+    });
+
+    let client = Client::builder().timeout(std::time::Duration::from_secs(30)).build()?;
+    client
+        .post("http://localhost:3001/info")
+        .header("Content-Type", "application/json")
+        .json(&payload)
+        .send()
+        .await?
+        .error_for_status()?;
     Ok(())
 }
 
-pub(super) async fn process_rmp_file(config: &SnapshotConfig) -> Result<PathBuf> {
-    info!("Triggering L4 snapshot (mode: {:?})", config.mode);
+async fn process_via_cli(dir: &Path, output_path: &Path) -> Result<()> {
+    let abci_states_dir = dir.join("hl/data/periodic_abci_states");
+    let (rmp_path, height) = find_latest_rmp(&abci_states_dir).await?;
+    info!("Using periodic ABCI state at height {height}: {}", rmp_path.display());
 
-    let parent_dir = config.data_dir.parent().unwrap_or(&config.data_dir);
-    let output_path: PathBuf;
+    let hl_node = std::env::var("HL_NODE_PATH").unwrap_or_else(|_| "hl-node".to_string());
+    let chain = std::env::var("HL_CHAIN").unwrap_or_else(|_| "Mainnet".to_string());
+    let raw_output = dir.join("l4_raw.json");
 
-    match config.mode {
-        SnapshotMode::Docker => {
-            output_path = config.snapshot_output_path.clone().unwrap_or_else(|| parent_dir.join("snapshot.json"));
+    let result = tokio::process::Command::new(&hl_node)
+        .args(["--chain", &chain, "compute-l4-snapshots", "--include-users"])
+        .arg(&rmp_path)
+        .arg(&raw_output)
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run '{hl_node}': {e}. Set HL_NODE_PATH to the hl-node binary location."))?;
 
-            let mut cmd = Command::new("docker");
-            cmd.args(&[
-                "exec",
-                &config.docker_container,
-                "./hl-node",
-                "--chain",
-                "Mainnet",
-                "compute-l4-snapshots",
-                "--include-users",
-                "hl/hyperliquid_data/abci_state.rmp",
-                "hl/snapshot.json",
-            ]);
-            run_hl_node_cmd(&mut cmd).await?;
-        }
-        SnapshotMode::Direct => {
-            let abci_path = config
-                .abci_state_path
-                .clone()
-                .unwrap_or_else(|| config.data_dir.join("hl/hyperliquid_data/abci_state.rmp"));
-            output_path = config.snapshot_output_path.clone().unwrap_or_else(|| PathBuf::from("/tmp/hl_snapshot.json"));
+    if !result.status.success() {
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        return Err(format!("hl-node compute-l4-snapshots failed: {stderr}").into());
+    }
 
-            let mut cmd = Command::new(&config.hlnode_binary);
-            cmd.args(&["--chain", "Mainnet", "compute-l4-snapshots", "--include-users"])
-                .arg(abci_path)
-                .arg(&output_path);
-            run_hl_node_cmd(&mut cmd).await?;
+    // The CLI outputs [[coin, [bids, asks]], ...] without a height prefix.
+    // Wrap it as [height, data] to match the fileSnapshot API format.
+    let raw_content = fs::read_to_string(&raw_output).await?;
+    let wrapped = format!("[{height},{raw_content}]");
+    fs::write(output_path, wrapped).await?;
+
+    // Clean up temporary file
+    drop(fs::remove_file(&raw_output).await);
+
+    Ok(())
+}
+
+async fn find_latest_rmp(abci_states_dir: &Path) -> Result<(PathBuf, u64)> {
+    let mut latest_date: Option<String> = None;
+    let mut entries =
+        fs::read_dir(abci_states_dir).await.map_err(|e| format!("Cannot read periodic_abci_states directory: {e}"))?;
+
+    while let Some(entry) = entries.next_entry().await? {
+        if entry.file_type().await?.is_dir() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if latest_date.as_ref().is_none_or(|d| name > *d) {
+                latest_date = Some(name);
+            }
         }
     }
 
-    if output_path.exists() {
-        info!("Snapshot file found at: {:?}", output_path);
-        Ok(output_path)
-    } else {
-        if let Some(parent) = output_path.parent() {
-            if let Ok(entries) = fs::read_dir(parent) {
-                for entry in entries.flatten() {
-                    error!("Found sibling: {:?}", entry.path());
+    let date_dir = latest_date.ok_or("No date directories found in periodic_abci_states")?;
+    let date_path = abci_states_dir.join(&date_dir);
+
+    let mut latest_height: Option<u64> = None;
+    let mut latest_path: Option<PathBuf> = None;
+    let mut entries = fs::read_dir(&date_path).await?;
+
+    while let Some(entry) = entries.next_entry().await? {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if let Some(height_str) = name.strip_suffix(".rmp") {
+            if let Ok(height) = height_str.parse::<u64>() {
+                if latest_height.is_none_or(|h| height > h) {
+                    latest_height = Some(height);
+                    latest_path = Some(entry.path());
                 }
             }
         }
-        Err("Snapshot file not created".into())
+    }
+
+    match (latest_path, latest_height) {
+        (Some(path), Some(height)) => Ok((path, height)),
+        _ => Err("No .rmp files found in periodic_abci_states".into()),
     }
 }
 
-pub(super) fn get_visor_path(config: &SnapshotConfig) -> PathBuf {
-    config.visor_state_path.clone().unwrap_or_else(|| {
-        config.data_dir.parent().unwrap_or(&config.data_dir).join("hyperliquid_data/visor_abci_state.json")
-    })
+pub(super) fn validate_snapshot_consistency<O: Clone + PartialEq + Debug>(
+    snapshot: &Snapshots<O>,
+    expected: Snapshots<O>,
+    ignore_spot: bool,
+) -> Result<()> {
+    let mut snapshot_map: HashMap<_, _> =
+        expected.value().into_iter().filter(|(c, _)| !c.is_spot() || !ignore_spot).collect();
+
+    for (coin, book) in snapshot.as_ref() {
+        if ignore_spot && coin.is_spot() {
+            continue;
+        }
+        let book1 = book.as_ref();
+        if let Some(book2) = snapshot_map.remove(coin) {
+            for (orders1, orders2) in book1.as_ref().iter().zip(book2.as_ref()) {
+                for (order1, order2) in orders1.iter().zip(orders2.iter()) {
+                    if *order1 != *order2 {
+                        return Err(
+                            format!("Orders do not match, expected: {:?} received: {:?}", *order2, *order1).into()
+                        );
+                    }
+                }
+            }
+        } else if !book1[0].is_empty() || !book1[1].is_empty() {
+            return Err(format!("Missing {} book", coin.value()).into());
+        }
+    }
+    if !snapshot_map.is_empty() {
+        return Err("Extra orderbooks detected".to_string().into());
+    }
+    Ok(())
 }
 
 impl L2SnapshotParams {
@@ -104,32 +186,23 @@ pub(super) fn compute_l2_snapshots<O: InnerOrder + Send + Sync>(order_books: &Or
             .as_ref()
             .par_iter()
             .map(|(coin, order_book)| {
-                let mut map = HashMap::with_capacity(8);
-
-                let base_params = L2SnapshotParams { n_sig_figs: None, mantissa: None };
+                let mut entries = HashMap::with_capacity(6);
                 let base_snapshot = order_book.to_l2_snapshot(None, None, None);
 
-                let mut last_snapshot = base_snapshot.clone();
-                map.insert(base_params, base_snapshot);
+                entries.insert(L2SnapshotParams::new(None, None), base_snapshot.clone());
 
                 for n_sig_figs in (2..=5).rev() {
                     if n_sig_figs == 5 {
                         for mantissa in [None, Some(2), Some(5)] {
-                            let params = L2SnapshotParams { n_sig_figs: Some(n_sig_figs), mantissa };
-                            let snapshot = last_snapshot.to_l2_snapshot(None, Some(n_sig_figs), mantissa);
-                            if mantissa.is_none() {
-                                last_snapshot = snapshot.clone();
-                            }
-                            map.insert(params, snapshot);
+                            let snap = base_snapshot.to_l2_snapshot(None, Some(n_sig_figs), mantissa);
+                            entries.insert(L2SnapshotParams::new(Some(n_sig_figs), mantissa), snap);
                         }
                     } else {
-                        let params = L2SnapshotParams { n_sig_figs: Some(n_sig_figs), mantissa: None };
-                        let snapshot = last_snapshot.to_l2_snapshot(None, Some(n_sig_figs), None);
-                        last_snapshot = snapshot.clone();
-                        map.insert(params, snapshot);
+                        let snap = base_snapshot.to_l2_snapshot(None, Some(n_sig_figs), None);
+                        entries.insert(L2SnapshotParams::new(Some(n_sig_figs), None), snap);
                     }
                 }
-                (coin.clone(), map)
+                (coin.clone(), entries)
             })
             .collect(),
     )
@@ -139,4 +212,34 @@ pub(super) enum EventBatch {
     Orders(Batch<NodeDataOrderStatus>),
     BookDiffs(Batch<NodeDataOrderDiff>),
     Fills(Batch<NodeDataFill>),
+}
+
+pub(super) struct BatchQueue<T> {
+    deque: VecDeque<Batch<T>>,
+    last_ts: Option<u64>,
+}
+
+impl<T> BatchQueue<T> {
+    pub(super) const fn new() -> Self {
+        Self { deque: VecDeque::new(), last_ts: None }
+    }
+
+    pub(super) fn push(&mut self, block: Batch<T>) -> bool {
+        if let Some(last_ts) = self.last_ts
+            && last_ts >= block.block_number()
+        {
+            return false;
+        }
+        self.last_ts = Some(block.block_number());
+        self.deque.push_back(block);
+        true
+    }
+
+    pub(super) fn pop_front(&mut self) -> Option<Batch<T>> {
+        self.deque.pop_front()
+    }
+
+    pub(super) fn front(&self) -> Option<&Batch<T>> {
+        self.deque.front()
+    }
 }

@@ -5,14 +5,18 @@ use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    order_book::{Coin, Oid},
+    order_book::{Coin, Oid, Side},
     types::{Fill, L4Order, OrderDiff},
 };
+
+const ASSISTANCE_FUND: Address = Address::repeat_byte(0xFE);
+const HIP_2: Address = Address::repeat_byte(0xFF);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct NodeDataOrderDiff {
     user: Address,
     oid: u64,
+    side: Side,
     px: String,
     coin: String,
     pub(crate) raw_book_diff: OrderDiff,
@@ -29,19 +33,27 @@ impl NodeDataOrderDiff {
     pub(crate) fn coin(&self) -> Coin {
         Coin::new(&self.coin)
     }
+    pub(crate) fn user(&self) -> Address {
+        self.user
+    }
+    pub(crate) fn side(&self) -> Side {
+        self.side
+    }
+    pub(crate) fn px(&self) -> String {
+        self.px.clone()
+    }
+    pub(crate) fn special_address(&self) -> bool {
+        self.user == ASSISTANCE_FUND || self.user == HIP_2
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct NodeDataFill(pub Address, pub Fill);
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct NodeDataOrderStatus {
     pub time: NaiveDateTime,
     pub user: Address,
-    #[serde(default)]
-    pub hash: Option<String>,
-    #[serde(default)]
-    pub builder: Option<serde_json::Value>,
     pub status: String,
     pub order: L4Order,
 }
@@ -61,14 +73,12 @@ pub(crate) enum EventSource {
 }
 
 impl EventSource {
-    /// Get streaming directory (for --stream-with-block-info mode)
     #[must_use]
-    pub(crate) fn event_source_dir_streaming(self, dir: &Path) -> PathBuf {
-        // Uses *_streaming directories (HFT mode with --stream-with-block-info)
+    pub(crate) fn event_source_dir(self, dir: &Path) -> PathBuf {
         match self {
-            Self::Fills => dir.join("node_fills_streaming"),
-            Self::OrderStatuses => dir.join("node_order_statuses_streaming"),
-            Self::OrderDiffs => dir.join("node_raw_book_diffs_streaming"),
+            Self::Fills => dir.join("hl/data/node_fills_by_block"),
+            Self::OrderStatuses => dir.join("hl/data/node_order_statuses_by_block"),
+            Self::OrderDiffs => dir.join("hl/data/node_raw_book_diffs_by_block"),
         }
     }
 }
