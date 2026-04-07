@@ -1,4 +1,5 @@
 use crate::{
+    SnapshotMode,
     listeners::order_book::{L2SnapshotParams, L2Snapshots},
     order_book::{Snapshot, multi_book::OrderBooks, types::InnerOrder},
     prelude::*,
@@ -9,12 +10,13 @@ use crate::{
 };
 use log::{error, info};
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+};
 use tokio::process::Command;
 
-use crate::SnapshotMode;
-
-/// Configuration for snapshot fetching
 #[derive(Debug, Clone)]
 pub(super) struct SnapshotConfig {
     pub mode: SnapshotMode,
@@ -26,134 +28,74 @@ pub(super) struct SnapshotConfig {
     pub data_dir: PathBuf,
 }
 
+async fn run_hl_node_cmd(cmd: &mut Command) -> Result<()> {
+    let output = cmd.output().await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        error!("hl-node command failed.\nSTDOUT: {}\nSTDERR: {}", stdout, stderr);
+        return Err("hl-node execution failed".into());
+    }
+    Ok(())
+}
+
 pub(super) async fn process_rmp_file(config: &SnapshotConfig) -> Result<PathBuf> {
-    info!("Triggering L4 snapshot via hl-node CLI (mode: {:?})...", config.mode);
+    info!("Triggering L4 snapshot (mode: {:?})", config.mode);
 
-    let (output_path, _visor_path) = match config.mode {
+    let parent_dir = config.data_dir.parent().unwrap_or(&config.data_dir);
+    let output_path: PathBuf;
+
+    match config.mode {
         SnapshotMode::Docker => {
-            // Docker mode: run command inside container
-            // data_dir should be the path containing node_*_by_block directories
-            // Snapshot goes to parent of data_dir (sibling to "data" folder)
-            let parent_dir = config.data_dir.parent().unwrap_or(&config.data_dir);
-            let output_path = config.snapshot_output_path.clone().unwrap_or_else(|| parent_dir.join("snapshot.json"));
-            let visor_path = config
-                .visor_state_path
-                .clone()
-                .unwrap_or_else(|| parent_dir.join("hyperliquid_data/visor_abci_state.json"));
+            output_path = config.snapshot_output_path.clone().unwrap_or_else(|| parent_dir.join("snapshot.json"));
 
-            let output = Command::new("docker")
-                .args(&[
-                    "exec",
-                    &config.docker_container,
-                    "./hl-node",
-                    "--chain",
-                    "Mainnet",
-                    "compute-l4-snapshots",
-                    "--include-users",
-                    "hl/hyperliquid_data/abci_state.rmp",
-                    "hl/snapshot.json",
-                ])
-                .output()
-                .await;
-
-            match output {
-                Ok(out) => {
-                    if !out.status.success() {
-                        error!("hl-node compute-l4-snapshots failed: {}", String::from_utf8_lossy(&out.stderr));
-                        return Err("hl-node compute-l4-snapshots failed".into());
-                    }
-                    info!("L4 snapshot computed successfully (docker mode)");
-                }
-                Err(e) => {
-                    error!("Failed to execute docker command: {}", e);
-                    return Err(e.into());
-                }
-            }
-
-            (output_path, visor_path)
+            let mut cmd = Command::new("docker");
+            cmd.args(&[
+                "exec",
+                &config.docker_container,
+                "./hl-node",
+                "--chain",
+                "Mainnet",
+                "compute-l4-snapshots",
+                "--include-users",
+                "hl/hyperliquid_data/abci_state.rmp",
+                "hl/snapshot.json",
+            ]);
+            run_hl_node_cmd(&mut cmd).await?;
         }
         SnapshotMode::Direct => {
-            // Direct mode: run hl-node directly on host
             let abci_path = config
                 .abci_state_path
                 .clone()
                 .unwrap_or_else(|| config.data_dir.join("hl/hyperliquid_data/abci_state.rmp"));
-            let output_path =
-                config.snapshot_output_path.clone().unwrap_or_else(|| PathBuf::from("/tmp/hl_snapshot.json"));
-            let visor_path = config
-                .visor_state_path
-                .clone()
-                .unwrap_or_else(|| config.data_dir.join("hl/hyperliquid_data/visor_abci_state.json"));
+            output_path = config.snapshot_output_path.clone().unwrap_or_else(|| PathBuf::from("/tmp/hl_snapshot.json"));
 
-            info!(
-                "Running: {} --chain Mainnet compute-l4-snapshots --include-users {} {}",
-                &config.hlnode_binary,
-                abci_path.display(),
-                output_path.display()
-            );
-
-            let output = Command::new(&config.hlnode_binary)
-                .args(&[
-                    "--chain",
-                    "Mainnet",
-                    "compute-l4-snapshots",
-                    "--include-users",
-                    abci_path.to_str().unwrap_or(""),
-                    output_path.to_str().unwrap_or(""),
-                ])
-                .output()
-                .await;
-
-            match output {
-                Ok(out) => {
-                    if !out.status.success() {
-                        error!("hl-node compute-l4-snapshots failed: {}", String::from_utf8_lossy(&out.stderr));
-                        error!("stdout: {}", String::from_utf8_lossy(&out.stdout));
-                        return Err("hl-node compute-l4-snapshots failed".into());
-                    }
-                    info!("L4 snapshot computed successfully (direct mode)");
-                }
-                Err(e) => {
-                    error!("Failed to execute hl-node command: {}", e);
-                    return Err(e.into());
-                }
-            }
-
-            (output_path, visor_path)
+            let mut cmd = Command::new(&config.hlnode_binary);
+            cmd.args(&["--chain", "Mainnet", "compute-l4-snapshots", "--include-users"])
+                .arg(abci_path)
+                .arg(&output_path);
+            run_hl_node_cmd(&mut cmd).await?;
         }
-    };
+    }
 
-    // Verify file exists
     if output_path.exists() {
         info!("Snapshot file found at: {:?}", output_path);
-        // Return tuple (output_path, visor_path) - but for now just output_path
-        // The caller needs visor_path too, so we'll store it
-        return Ok(output_path);
-    }
-
-    // Debug: List directory contents if file not found
-    if let Some(parent) = output_path.parent() {
-        error!("File not found. Listing directory {:?}:", parent);
-        if let Ok(entries) = fs::read_dir(parent) {
-            for entry in entries.flatten() {
-                error!(" - {:?}", entry.path());
+        Ok(output_path)
+    } else {
+        if let Some(parent) = output_path.parent() {
+            if let Ok(entries) = fs::read_dir(parent) {
+                for entry in entries.flatten() {
+                    error!("Found sibling: {:?}", entry.path());
+                }
             }
-        } else {
-            error!("Failed to read directory {:?}", parent);
         }
+        Err("Snapshot file not created".into())
     }
-
-    Err("Snapshot file not created".into())
 }
 
-/// Get the visor state path based on config
-/// Get the visor state path based on config
-/// data_dir should be the path containing node_*_by_block directories
-/// visor_abci_state.json is in parent/hyperliquid_data/
 pub(super) fn get_visor_path(config: &SnapshotConfig) -> PathBuf {
     config.visor_state_path.clone().unwrap_or_else(|| {
-        let parent_dir = config.data_dir.parent().unwrap_or(&config.data_dir);
-        parent_dir.join("hyperliquid_data/visor_abci_state.json")
+        config.data_dir.parent().unwrap_or(&config.data_dir).join("hyperliquid_data/visor_abci_state.json")
     })
 }
 
@@ -169,30 +111,32 @@ pub(super) fn compute_l2_snapshots<O: InnerOrder + Send + Sync>(order_books: &Or
             .as_ref()
             .par_iter()
             .map(|(coin, order_book)| {
-                let mut entries = Vec::new();
-                let snapshot = order_book.to_l2_snapshot(None, None, None);
-                entries.push((L2SnapshotParams { n_sig_figs: None, mantissa: None }, snapshot));
-                let mut add_new_snapshot = |n_sig_figs: Option<u32>, mantissa: Option<u64>, idx: usize| {
-                    if let Some((_, last_snapshot)) = &entries.get(entries.len() - idx) {
-                        let snapshot = last_snapshot.to_l2_snapshot(None, n_sig_figs, mantissa);
-                        entries.push((L2SnapshotParams { n_sig_figs, mantissa }, snapshot));
-                    }
-                };
+                let mut map = HashMap::with_capacity(8);
+
+                let base_params = L2SnapshotParams { n_sig_figs: None, mantissa: None };
+                let base_snapshot = order_book.to_l2_snapshot(None, None, None);
+
+                let mut last_snapshot = base_snapshot.clone();
+                map.insert(base_params, base_snapshot);
+
                 for n_sig_figs in (2..=5).rev() {
                     if n_sig_figs == 5 {
                         for mantissa in [None, Some(2), Some(5)] {
-                            if mantissa == Some(5) {
-                                // Some(2) is NOT a superset of this info!
-                                add_new_snapshot(Some(n_sig_figs), mantissa, 2);
-                            } else {
-                                add_new_snapshot(Some(n_sig_figs), mantissa, 1);
+                            let params = L2SnapshotParams { n_sig_figs: Some(n_sig_figs), mantissa };
+                            let snapshot = last_snapshot.to_l2_snapshot(None, Some(n_sig_figs), mantissa);
+                            if mantissa.is_none() {
+                                last_snapshot = snapshot.clone();
                             }
+                            map.insert(params, snapshot);
                         }
                     } else {
-                        add_new_snapshot(Some(n_sig_figs), None, 1);
+                        let params = L2SnapshotParams { n_sig_figs: Some(n_sig_figs), mantissa: None };
+                        let snapshot = last_snapshot.to_l2_snapshot(None, Some(n_sig_figs), None);
+                        last_snapshot = snapshot.clone();
+                        map.insert(params, snapshot);
                     }
                 }
-                (coin.clone(), entries.into_iter().collect::<HashMap<L2SnapshotParams, Snapshot<InnerLevel>>>())
+                (coin.clone(), map)
             })
             .collect(),
     )
