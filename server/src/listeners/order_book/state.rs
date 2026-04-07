@@ -7,7 +7,7 @@ use crate::{
     prelude::*,
     types::{
         inner::{InnerL4Order, InnerOrderDiff},
-        node_data::{Batch, EventSource, NodeDataOrderDiff, NodeDataOrderStatus},
+        node_data::{Batch, NodeDataOrderDiff, NodeDataOrderStatus},
     },
 };
 use std::collections::{HashMap, HashSet};
@@ -40,14 +40,6 @@ impl OrderBookState {
         }
     }
 
-    pub(super) const fn height(&self) -> u64 {
-        self.height
-    }
-
-    pub(super) const fn time(&self) -> u64 {
-        self.time
-    }
-
     pub(super) fn compute_snapshot(&self) -> TimedSnapshots {
         TimedSnapshots { time: self.time, height: self.height, snapshot: self.order_book.to_snapshots_par() }
     }
@@ -58,35 +50,6 @@ impl OrderBookState {
 
     pub(super) fn compute_universe(&self) -> HashSet<Coin> {
         self.order_book.as_ref().keys().cloned().collect()
-    }
-
-    pub(super) fn pending_order_statuses_count(&self) -> usize {
-        self.pending_order_statuses.len()
-    }
-
-    pub(super) fn pending_new_diffs_count(&self) -> usize {
-        self.pending_new_diffs.len()
-    }
-
-    pub(super) fn order_count(&self) -> usize {
-        self.order_book.order_count()
-    }
-
-    pub(super) fn coin_count(&self) -> usize {
-        self.order_book.as_ref().len()
-    }
-
-    pub(super) fn cleanup_stale_pending(&mut self) {
-        const MAX_PENDING_ORDERS: usize = 10_000;
-        const MAX_PENDING_DIFFS: usize = 1_000;
-
-        if self.pending_order_statuses.len() > MAX_PENDING_ORDERS {
-            self.pending_order_statuses.clear();
-        }
-
-        if self.pending_new_diffs.len() > MAX_PENDING_DIFFS {
-            self.pending_new_diffs.clear();
-        }
     }
 
     pub(super) fn get_bbos_for_coins(
@@ -113,13 +76,13 @@ impl OrderBookState {
         }
 
         let mut changed_coins = HashSet::with_capacity(8);
-        for order_status in batch.into_events() {
+        for order_status in batch.events() {
             let oid = Oid::new(order_status.order.oid);
 
             if let Some(sz) = self.pending_new_diffs.remove(&oid) {
                 let order_coin = Coin::new(&order_status.order.coin);
                 let timestamp = order_status.time.and_utc().timestamp_millis();
-                let mut inner_order: InnerL4Order = order_status.try_into()?;
+                let mut inner_order: InnerL4Order = order_status.clone().try_into()?;
 
                 inner_order.modify_sz(sz);
                 inner_order.convert_trigger(timestamp as u64);
@@ -127,7 +90,7 @@ impl OrderBookState {
                 self.order_book.add_order(inner_order);
                 changed_coins.insert(order_coin);
             } else if order_status.is_inserted_into_book() {
-                self.pending_order_statuses.insert(oid, order_status);
+                self.pending_order_statuses.insert(oid, order_status.clone());
             }
         }
         Ok(changed_coins)
@@ -141,14 +104,14 @@ impl OrderBookState {
         }
 
         let mut changed_coins = HashSet::with_capacity(8);
-        for diff in batch.into_events() {
+        for diff in batch.events() {
             let coin = diff.coin();
             if coin.is_spot() && self.ignore_spot {
                 continue;
             }
 
             let oid = diff.oid();
-            let inner_diff = diff.diff().try_into()?;
+            let inner_diff: InnerOrderDiff = diff.diff().clone().try_into()?;
 
             match inner_diff {
                 InnerOrderDiff::New { sz } => {
@@ -168,11 +131,11 @@ impl OrderBookState {
                 }
                 InnerOrderDiff::Update { new_sz, .. } => {
                     let _ = self.order_book.modify_sz(oid, coin.clone(), new_sz);
-                    changed_coins.insert(coin);
+                    changed_coins.insert(coin.clone());
                 }
                 InnerOrderDiff::Remove => {
                     let _ = self.order_book.cancel_order(oid, coin.clone());
-                    changed_coins.insert(coin);
+                    changed_coins.insert(coin.clone());
                 }
             }
         }

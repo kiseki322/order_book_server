@@ -9,7 +9,6 @@ server = { path = "../server" }
 env_logger = "0.11.8"
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4.5.42", features = ["derive"] }
-axum = "0.8.4"
 log = "0.4"
 
 [lints]

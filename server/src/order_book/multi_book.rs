@@ -5,7 +5,7 @@ use crate::{
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     path::Path,
 };
 use tokio::fs::read_to_string;
@@ -32,10 +32,6 @@ impl<O: InnerOrder> OrderBooks<O> {
         &self.order_books
     }
 
-    /// Total number of orders across all orderbooks
-    pub(crate) fn order_count(&self) -> usize {
-        self.order_books.values().map(|book| book.order_count()).sum()
-    }
     #[must_use]
     pub(crate) fn from_snapshots(snapshot: Snapshots<O>, ignore_triggers: bool) -> Self {
         Self {
@@ -56,28 +52,23 @@ impl<O: InnerOrder> OrderBooks<O> {
         if let Some(book) = self.order_books.get_mut(&coin) {
             let success = book.cancel_order(oid.clone());
             if !success {
-                // oid not found in this coin's book
                 log::debug!("cancel_order: oid {:?} not found in {:?} book", oid, coin);
             }
             success
         } else {
-            // coin book doesn't exist
             log::debug!("cancel_order: no book for coin {:?}", coin);
             false
         }
     }
 
-    // change size to reflect how much gets matched during the block
     pub(crate) fn modify_sz(&mut self, oid: Oid, coin: Coin, sz: Sz) -> bool {
         self.order_books.get_mut(&coin).is_some_and(|book| book.modify_sz(oid, sz))
     }
 
-    /// Get BBO for specific coins only - faster for selective broadcast
-    /// Only computes BBO for coins in the set, avoiding iteration over all coins
     #[must_use]
     pub(crate) fn get_bbos_for_coins(
         &self,
-        coins: &std::collections::HashSet<Coin>,
+        coins: &HashSet<Coin>,
     ) -> HashMap<Coin, (Option<(Px, Sz, u32)>, Option<(Px, Sz, u32)>)> {
         coins.iter().filter_map(|coin| self.order_books.get(coin).map(|book| (coin.clone(), book.get_bbo()))).collect()
     }
@@ -91,8 +82,6 @@ impl<O: Send + Sync + InnerOrder> OrderBooks<O> {
     }
 }
 
-/// Load snapshots from CLI-generated JSON (without height prefix)
-/// Height is read separately from visor_abci_state.json
 pub(crate) fn load_snapshots_from_cli_str<O, R>(str: &str, height: u64) -> Result<(u64, Snapshots<O>)>
 where
     O: TryFrom<R, Error = Error>,
@@ -115,7 +104,6 @@ where
     ))
 }
 
-/// Load snapshots from CLI-generated JSON file + height from visor state
 pub(crate) async fn load_snapshots_from_cli_json<O, R>(
     snapshot_path: &Path,
     visor_state_path: &Path,
@@ -124,25 +112,23 @@ where
     O: TryFrom<R, Error = Error>,
     R: Serialize + for<'a> Deserialize<'a>,
 {
-    // Read height from visor_abci_state.json
     let visor_state = read_to_string(visor_state_path).await?;
     let visor: serde_json::Value = serde_json::from_str(&visor_state)?;
     let height = visor["height"].as_u64().ok_or("Missing height in visor state")?;
 
-    // Read snapshot
     let file_contents = read_to_string(snapshot_path).await?;
     load_snapshots_from_cli_str(&file_contents, height)
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::{
         order_book::{
             InnerOrder, OrderBook, Px, Side, Snapshot, Sz,
             levels::build_l2_level,
             multi_book::{Coin, Snapshots},
         },
-        prelude::*,
         types::{
             L4Order, Level,
             inner::{InnerL4Order, InnerLevel},
@@ -150,13 +136,11 @@ mod tests {
     };
     use alloy::primitives::Address;
     use itertools::Itertools;
-    use serde::{Deserialize, Serialize};
-    use std::{collections::HashMap, fs::create_dir_all, path::PathBuf};
-    use tokio::fs::read_to_string;
+    use std::{fs::create_dir_all, path::PathBuf};
 
     fn load_snapshots_from_str<O, R>(str: &str) -> Result<(u64, Snapshots<O>)>
     where
-        O: TryFrom<R, Error = crate::prelude::Error>,
+        O: TryFrom<R, Error = Error>,
         R: Serialize + for<'a> Deserialize<'a>,
     {
         #[allow(clippy::type_complexity)]
@@ -178,7 +162,7 @@ mod tests {
 
     async fn load_snapshots_from_json<O, R>(path: &PathBuf) -> Result<(u64, Snapshots<O>)>
     where
-        O: TryFrom<R, Error = crate::prelude::Error>,
+        O: TryFrom<R, Error = Error>,
         R: Serialize + for<'a> Deserialize<'a>,
     {
         let file_contents = read_to_string(path).await?;
@@ -342,7 +326,7 @@ mod tests {
     #[tokio::test]
     async fn test_deserialization_from_json() -> Result<()> {
         create_dir_all("tmp/deserialization_test")?;
-        fs::write("tmp/deserialization_test/out.json", SNAPSHOT_JSON)?;
+        std::fs::write("tmp/deserialization_test/out.json", SNAPSHOT_JSON)?;
         load_snapshots_from_json::<InnerL4Order, (Address, L4Order)>(&PathBuf::from(
             "tmp/deserialization_test/out.json",
         ))

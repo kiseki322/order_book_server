@@ -59,11 +59,6 @@ impl<O: InnerOrder> OrderBook<O> {
         Self { oid_to_side_px: HashMap::new(), bids: BTreeMap::new(), asks: BTreeMap::new() }
     }
 
-    /// Number of orders in this orderbook
-    pub(crate) fn order_count(&self) -> usize {
-        self.oid_to_side_px.len()
-    }
-
     pub(crate) fn add_order(&mut self, mut order: O) {
         let (maker_orders, resting_book) = match order.side() {
             Side::Ask => (&mut self.bids, &mut self.asks),

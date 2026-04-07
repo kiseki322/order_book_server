@@ -38,7 +38,6 @@ fn fetch_snapshot(
     tx: UnboundedSender<Result<()>>,
     _ignore_spot: bool,
 ) {
-    let tx = tx.clone();
     tokio::spawn(async move {
         {
             let mut listener = listener.lock().await;
@@ -67,7 +66,6 @@ fn fetch_snapshot(
             Err(err) => Err(err),
         };
         let _ = tx.send(res);
-        Ok::<(), Error>(())
     });
 }
 
@@ -127,18 +125,18 @@ impl OrderBookListener {
             return Ok(());
         }
 
-        let (height, event_batch) = match event_source {
+        let event_batch = match event_source {
             EventSource::Fills => {
                 let batch = sonic_rs::from_str::<Batch<NodeDataFill>>(&line)?;
-                (batch.block_number(), EventBatch::Fills(batch))
+                EventBatch::Fills(batch)
             }
             EventSource::OrderStatuses => {
                 let batch = sonic_rs::from_str::<Batch<NodeDataOrderStatus>>(&line)?;
-                (batch.block_number(), EventBatch::Orders(batch))
+                EventBatch::Orders(batch)
             }
             EventSource::OrderDiffs => {
                 let batch = sonic_rs::from_str::<Batch<NodeDataOrderDiff>>(&line)?;
-                (batch.block_number(), EventBatch::BookDiffs(batch))
+                EventBatch::BookDiffs(batch)
             }
         };
 

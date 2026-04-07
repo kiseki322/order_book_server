@@ -95,19 +95,6 @@ impl Subscription {
     }
 }
 
-impl Subscription {
-    pub(crate) const fn type_label(&self) -> &str {
-        match self {
-            Self::Bbo { .. } => "bbo",
-            Self::L2Book { .. } => "l2Book",
-            Self::L4Book { .. } => "l4Book",
-            Self::Trades { .. } => "trades",
-            Self::OrderUpdates { .. } => "orderUpdates",
-            Self::BookDiffs { .. } => "bookDiffs",
-        }
-    }
-}
-
 /// Order update for a specific user - streams raw order status data
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

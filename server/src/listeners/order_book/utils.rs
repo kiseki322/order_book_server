@@ -1,20 +1,13 @@
 use crate::{
     SnapshotMode,
     listeners::order_book::{L2SnapshotParams, L2Snapshots},
-    order_book::{Snapshot, multi_book::OrderBooks, types::InnerOrder},
+    order_book::{multi_book::OrderBooks, types::InnerOrder},
     prelude::*,
-    types::{
-        inner::InnerLevel,
-        node_data::{Batch, NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
-    },
+    types::node_data::{Batch, NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
 };
 use log::{error, info};
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
-use std::{
-    collections::HashMap,
-    fs,
-    path::{Path, PathBuf},
-};
+use std::{collections::HashMap, fs, path::PathBuf};
 use tokio::process::Command;
 
 #[derive(Debug, Clone)]

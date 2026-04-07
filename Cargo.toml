@@ -51,7 +51,7 @@ ffi_unwind_calls                              = { level = "warn" }
 keyword-idents                                = { level = "warn" }
 keyword_idents_2018                           = { level = "warn" }
 keyword_idents_2024                           = { level = "warn" }
-let_underscore_drop                           = { level = "warn" }
+let_underscore_drop                           = { level = "allow" }
 macro_use_extern_crate                        = { level = "warn" }
 missing_abi                                   = { level = "warn" }
 non_ascii_idents                              = { level = "warn" }

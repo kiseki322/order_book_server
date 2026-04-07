@@ -1,7 +1,6 @@
 use crate::types::node_data::EventSource;
 use crossbeam_channel::{Sender, unbounded};
-use log::{error, info};
-use notify::{Event, RecursiveMode, Watcher, recommended_watcher};
+use notify::{RecursiveMode, Watcher, recommended_watcher};
 use std::{
     fs::File,
     io::{Read, Seek, SeekFrom},
@@ -136,12 +135,6 @@ impl FileReader {
         self.file_position = 0;
         self.partial_line.clear();
         old_lines
-    }
-
-    fn start_tracking(&mut self, path: &PathBuf) {
-        self.file_position = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-        self.current_path = Some(path.clone());
-        self.partial_line.clear();
     }
 }
 
