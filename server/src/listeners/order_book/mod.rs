@@ -29,8 +29,9 @@ use crate::{
         multi_book::{Snapshots, load_snapshots_from_json},
     },
     prelude::*,
+    servers::websocket_server::{coin_to_book_updates, coin_to_trades},
     types::{
-        L4Order,
+        L4BookUpdates, L4Order, Trade,
         inner::{InnerL4Order, InnerLevel},
         node_data::{Batch, EventSource, NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
     },
@@ -291,12 +292,14 @@ impl OrderBookListener {
             EventBatch::Fills(batch) => {
                 if self.last_fill.is_none_or(|height| height < batch.block_number()) {
                     if let Some(tx) = &self.internal_message_tx {
-                        let msg = Arc::new(InternalMessage::Fills { batch });
-                        let _unused = tx.send(msg);
+                        let trades = Arc::new(coin_to_trades(&batch));
+                        let msg = Arc::new(InternalMessage::Fills { trades });
+                        drop(tx.send(msg));
                     }
                 }
             }
         }
+
         if self.is_ready()
             && let Some((order_statuses, order_diffs)) = self.pop_cache()
         {
@@ -305,14 +308,10 @@ impl OrderBookListener {
                 .map(|book| book.apply_updates(order_statuses.clone(), order_diffs.clone()))
                 .transpose()?;
 
-            if let Some(cache) = &mut self.fetched_snapshot_cache {
-                cache.push_back((order_statuses.clone(), order_diffs.clone()));
-            }
-
             if let Some(tx) = &self.internal_message_tx {
-                let updates =
-                    Arc::new(InternalMessage::L4BookUpdates { diff_batch: order_diffs, status_batch: order_statuses });
-                let _unused = tx.send(updates);
+                let updates = Arc::new(coin_to_book_updates(&order_diffs, &order_statuses));
+                let msg = Arc::new(InternalMessage::L4BookUpdates { updates });
+                drop(tx.send(msg));
             }
         }
         Ok(())
@@ -461,7 +460,7 @@ impl DirectoryListener for OrderBookListener {
                 && let Some(tx) = &self.internal_message_tx
             {
                 let tx = tx.clone();
-                let msg = Arc::new(InternalMessage::Snapshot { l2_snapshots: snapshot.1, time: snapshot.0 });
+                let msg = Arc::new(InternalMessage::Snapshot { l2_snapshots: Arc::new(snapshot.1), time: snapshot.0 });
                 let _unused = tx.send(msg);
                 self.last_snapshot_sent = now;
             }
@@ -486,9 +485,9 @@ pub(crate) struct TimedSnapshots {
 
 // Messages sent from node data listener to websocket dispatch to support streaming
 pub(crate) enum InternalMessage {
-    Snapshot { l2_snapshots: L2Snapshots, time: u64 },
-    Fills { batch: Batch<NodeDataFill> },
-    L4BookUpdates { diff_batch: Batch<NodeDataOrderDiff>, status_batch: Batch<NodeDataOrderStatus> },
+    Snapshot { l2_snapshots: Arc<L2Snapshots>, time: u64 },
+    Fills { trades: Arc<HashMap<String, Vec<Trade>>> },
+    L4BookUpdates { updates: Arc<HashMap<String, L4BookUpdates>> },
 }
 
 #[derive(Eq, PartialEq, Hash)]

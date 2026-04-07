@@ -11,7 +11,7 @@ use axum::{
     routing::get,
 };
 use futures_util::{SinkExt, StreamExt};
-use log::{error, info, warn};
+use log::{error, info};
 use tokio::{
     net::TcpListener,
     select,
@@ -27,11 +27,10 @@ use crate::{
     listeners::order_book::{
         InternalMessage, L2SnapshotParams, L2Snapshots, OrderBookListener, TimedSnapshots, hl_listen,
     },
-    order_book::{Coin, Snapshot},
+    order_book::Coin,
     prelude::*,
     types::{
         L2Book, L4Book, L4BookUpdates, L4Order, Trade,
-        inner::InnerLevel,
         node_data::{Batch, NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
         subscription::{ClientMessage, DEFAULT_LEVELS, ServerResponse, Subscription, SubscriptionManager},
     },
@@ -162,36 +161,30 @@ async fn handle_socket(
                                     }
                                 }
                             },
-                            InternalMessage::Fills{ batch } => {
-                                let mut trades = coin_to_trades(batch);
+                            InternalMessage::Fills { trades } => {
                                 for sub in manager.subscriptions() {
                                     if let Subscription::Trades { coin } = sub {
-                                        if let Some(t) = trades.remove(coin) {
-                                            drop(out_tx.try_send(ServerResponse::Trades(t)));
+                                        if let Some(t) = trades.get(coin) {
+                                            drop(out_tx.try_send(ServerResponse::Trades(t.clone())));
                                         }
                                     }
                                 }
                             },
-                            InternalMessage::L4BookUpdates{ diff_batch, status_batch } => {
-                                let mut book_updates = coin_to_book_updates(diff_batch, status_batch);
+                            InternalMessage::L4BookUpdates { updates } => {
                                 for sub in manager.subscriptions() {
                                     if let Subscription::L4Book { coin } = sub {
-                                        if let Some(updates) = book_updates.remove(coin) {
-                                            drop(out_tx.try_send(ServerResponse::L4Book(L4Book::Updates(updates))));
+                                        if let Some(upd) = updates.get(coin) {
+                                            drop(out_tx.try_send(ServerResponse::L4Book(L4Book::Updates(upd.clone()))));
                                         }
                                     }
                                 }
                             },
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        warn!("Client lagged by {n} messages, attempting to stay synced");
-                        continue;
-                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(_) => return,
                 }
             }
-
             msg = socket_read.next() => {
                 if let Some(frame) = msg {
                     if frame.opcode == OpCode::Text {
@@ -200,12 +193,8 @@ async fn handle_socket(
                                 receive_client_message(&out_tx, &mut manager, value, &universe, listener.clone()).await;
                             }
                         }
-                    } else if frame.opcode == OpCode::Close {
-                        return;
-                    }
-                } else {
-                    return;
-                }
+                    } else if frame.opcode == OpCode::Close { return; }
+                } else { return; }
             }
         }
     }
@@ -244,14 +233,14 @@ async fn receive_client_message(
 
 fn prepare_l2_snapshot_response(
     subscription: &Subscription,
-    snapshot: &HashMap<Coin, HashMap<L2SnapshotParams, Snapshot<InnerLevel>>>,
+    l2_snapshots: &L2Snapshots,
     time: u64,
 ) -> Option<ServerResponse> {
     if let Subscription::L2Book { coin, n_sig_figs, n_levels, mantissa } = subscription {
         let coin_obj = Coin::new(coin);
         let params = L2SnapshotParams::new(*n_sig_figs, *mantissa);
 
-        let l2_snap = snapshot.get(&coin_obj)?.get(&params)?;
+        let l2_snap = l2_snapshots.as_ref().get(&coin_obj)?.get(&params)?;
         let n = n_levels.unwrap_or(DEFAULT_LEVELS);
         let truncated = l2_snap.truncate(n);
         let exported = truncated.export_inner_snapshot();
@@ -269,7 +258,7 @@ fn new_universe(l2_snapshots: &L2Snapshots, ignore_spot: bool) -> HashSet<String
         .collect()
 }
 
-fn coin_to_trades(batch: &Batch<NodeDataFill>) -> HashMap<String, Vec<Trade>> {
+pub(crate) fn coin_to_trades(batch: &Batch<NodeDataFill>) -> HashMap<String, Vec<Trade>> {
     let mut fills = batch.clone().events();
     let mut trades = HashMap::new();
     while fills.len() >= 2 {
@@ -285,7 +274,7 @@ fn coin_to_trades(batch: &Batch<NodeDataFill>) -> HashMap<String, Vec<Trade>> {
     trades
 }
 
-fn coin_to_book_updates(
+pub(crate) fn coin_to_book_updates(
     diff_batch: &Batch<NodeDataOrderDiff>,
     status_batch: &Batch<NodeDataOrderStatus>,
 ) -> HashMap<String, L4BookUpdates> {

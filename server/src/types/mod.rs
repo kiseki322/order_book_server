@@ -12,7 +12,7 @@ pub(crate) mod inner;
 pub(crate) mod node_data;
 pub(crate) mod subscription;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Trade {
     pub coin: String,
     side: Side,
@@ -24,7 +24,7 @@ pub(crate) struct Trade {
     users: [Address; 2],
 }
 
-#[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Level {
     px: String,
     sz: String,
@@ -37,14 +37,14 @@ impl Level {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct L2Book {
     coin: String,
     time: u64,
     levels: [Vec<Level>; 2],
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum L4Book {
     Snapshot { coin: String, time: u64, height: u64, levels: [Vec<L4Order>; 2] },
     Updates(L4BookUpdates),
@@ -76,7 +76,7 @@ impl Trade {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct L4BookUpdates {
     pub time: u64,
     pub height: u64,
