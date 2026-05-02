@@ -109,7 +109,6 @@ impl OrderBookState {
                         let time = order.time.and_utc().timestamp_millis();
                         let mut inner_order: InnerL4Order = order.try_into()?;
                         inner_order.modify_sz(sz);
-                        // must replace time with time of entering book, which is the timestamp of the order status update
                         #[allow(clippy::unwrap_used)]
                         inner_order.convert_trigger(time.try_into().unwrap());
                         self.order_book.add_order(inner_order);
@@ -136,17 +135,20 @@ impl OrderBookState {
                         self.order_book.add_order(inner_order);
                         self.cached_universe = None;
                     } else {
-                        return Err(format!("Unable to find order opening status {diff:?}").into());
+                        log::warn!("Unable to find order opening status for oid: {oid:?}. Skipping.");
+                        continue;
                     }
                 }
                 InnerOrderDiff::Update { new_sz, .. } => {
-                    if !self.order_book.modify_sz(oid, coin, new_sz) {
-                        return Err(format!("Unable to find order on the book {diff:?}").into());
+                    if !self.order_book.modify_sz(oid.clone(), coin, new_sz) {
+                        log::warn!("Unable to find order on the book for Update. oid: {oid:?}. Skipping.");
+                        continue;
                     }
                 }
                 InnerOrderDiff::Remove => {
-                    if !self.order_book.cancel_order(oid, coin) {
-                        return Err(format!("Unable to find order on the book {diff:?}").into());
+                    if !self.order_book.cancel_order(oid.clone(), coin) {
+                        log::warn!("Unable to find order on the book for Remove. oid: {oid:?}. Skipping.");
+                        continue;
                     }
                 }
             }
