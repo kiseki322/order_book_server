@@ -259,17 +259,12 @@ fn new_universe(l2_snapshots: &L2Snapshots, ignore_spot: bool) -> HashSet<String
 }
 
 pub(crate) fn coin_to_trades(batch: &Batch<NodeDataFill>) -> HashMap<String, Vec<Trade>> {
-    let mut fills = batch.clone().events();
-    let mut trades = HashMap::new();
-    while fills.len() >= 2 {
-        if let (Some(f2), Some(f1)) = (fills.pop(), fills.pop()) {
-            let mut map = HashMap::new();
-            map.insert(f1.1.side, f1);
-            map.insert(f2.1.side, f2);
-            let trade = Trade::from_fills(map);
-            let coin = trade.coin.clone();
-            trades.entry(coin).or_insert_with(Vec::new).push(trade);
-        }
+    let fills = batch.clone().events();
+    let mut trades: HashMap<String, Vec<Trade>> = HashMap::new();
+    for fill in fills {
+        let trade = Trade::from_single_fill(fill);
+        let coin = trade.coin.clone();
+        trades.entry(coin).or_insert_with(Vec::new).push(trade);
     }
     trades
 }

@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use alloy::primitives::Address;
 use serde::{Deserialize, Serialize};
 
@@ -15,13 +13,13 @@ pub(crate) mod subscription;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Trade {
     pub coin: String,
-    side: Side,
-    px: String,
-    sz: String,
-    hash: String,
-    time: u64,
-    tid: u64,
-    users: [Address; 2],
+    pub side: Side,
+    pub px: String,
+    pub sz: String,
+    pub hash: String,
+    pub time: u64,
+    pub tid: u64,
+    pub user: Address,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -57,22 +55,18 @@ impl L2Book {
 }
 
 impl Trade {
-    #[allow(clippy::unwrap_used)]
-    pub(crate) fn from_fills(mut fills: HashMap<Side, NodeDataFill>) -> Self {
-        let NodeDataFill(seller, ask_fill) = fills.remove(&Side::Ask).unwrap();
-        let NodeDataFill(buyer, bid_fill) = fills.remove(&Side::Bid).unwrap();
-        let ask_is_taker = ask_fill.crossed;
-        let side = if ask_is_taker { Side::Ask } else { Side::Bid };
-        let coin = ask_fill.coin.clone();
-        assert_eq!(coin, bid_fill.coin);
-        let tid = ask_fill.tid;
-        assert_eq!(tid, bid_fill.tid);
-        let px = ask_fill.px;
-        let sz = ask_fill.sz;
-        let hash = ask_fill.hash;
-        let time = ask_fill.time;
-        let users = [buyer, seller];
-        Self { coin, side, px, sz, hash, time, tid, users }
+    pub(crate) fn from_single_fill(fill: NodeDataFill) -> Self {
+        let NodeDataFill(user, fill_data) = fill;
+        Self {
+            coin: fill_data.coin,
+            side: fill_data.side,
+            px: fill_data.px,
+            sz: fill_data.sz,
+            hash: fill_data.hash,
+            time: fill_data.time,
+            tid: fill_data.tid,
+            user,
+        }
     }
 }
 
