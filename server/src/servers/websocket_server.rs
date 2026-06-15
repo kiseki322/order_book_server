@@ -121,9 +121,15 @@ async fn handle_socket(
     let (mut socket_write, mut socket_read) = socket.split();
     let mut internal_message_rx = internal_message_tx.subscribe();
 
-    let is_ready = listener.lock().await.is_ready();
+    let is_ready = {
+        let lock = listener.lock().await;
+        lock.is_ready()
+    };
     let mut manager = SubscriptionManager::default();
-    let universe_set = listener.lock().await.universe();
+    let universe_set = {
+        let mut lock = listener.lock().await;
+        lock.universe()
+    };
     let mut universe: HashSet<String> = universe_set.into_iter().map(|c| c.value()).collect();
 
     if !is_ready {
@@ -134,7 +140,7 @@ async fn handle_socket(
         return;
     }
 
-    let (out_tx, mut out_rx) = mpsc::channel::<ServerResponse>(1024);
+    let (out_tx, mut out_rx) = mpsc::channel::<ServerResponse>(4096);
 
     tokio::spawn(async move {
         while let Some(msg) = out_rx.recv().await {
@@ -293,7 +299,10 @@ impl Subscription {
         listener: Arc<Mutex<OrderBookListener>>,
     ) -> Result<Option<ServerResponse>> {
         if let Self::L4Book { coin } = self {
-            let state = listener.lock().await.compute_snapshot();
+            let state = {
+                let mut lock = listener.lock().await;
+                lock.compute_snapshot()
+            };
             if let Some(TimedSnapshots { time, height, snapshot }) = state {
                 let coin_key = Coin::new(coin);
                 if let Some((c, s)) = snapshot.value().into_iter().find(|(c, _)| *c == coin_key) {

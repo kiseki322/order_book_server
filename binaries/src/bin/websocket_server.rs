@@ -17,8 +17,8 @@ struct Args {
 
     /// Compression level for WebSocket connections.
     /// Accepts values in the range `0..=9`.
-    /// * `0` – compression disabled.
-    /// * `1` – fastest compression, low compression ratio (default).
+    /// * `0` – compression disabled (default).
+    /// * `1` – fastest compression, low compression ratio.
     /// * `9` – slowest compression, highest compression ratio.
     ///
     /// The level is passed to `flate2::Compression::new(level)`; see the
@@ -50,7 +50,7 @@ async fn main() -> Result<()> {
     println!("Running websocket server on {full_address}");
 
     let ignore_spot = !args.include_spot_unsafe.unwrap_or(false);
-    let compression_level = args.websocket_compression_level.unwrap_or(/* Some compression */ 1);
+    let compression_level = args.websocket_compression_level.unwrap_or(/* Some compression */ 0);
     let inactivity_exit_secs = args.inactivity_exit_secs.unwrap_or(5).max(5);
     run_websocket_server(&full_address, ignore_spot, compression_level, inactivity_exit_secs).await?;
 
