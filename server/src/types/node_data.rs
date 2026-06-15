@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     order_book::{Coin, Oid, Side},
-    types::{Fill, L4Order, OrderDiff},
+    types::{L4Order, OrderDiff},
 };
 
 const ASSISTANCE_FUND: Address = Address::repeat_byte(0xFE);
@@ -47,9 +47,6 @@ impl NodeDataOrderDiff {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct NodeDataFill(pub Address, pub Fill);
-
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct NodeDataOrderStatus {
     pub time: NaiveDateTime,
@@ -67,7 +64,6 @@ impl NodeDataOrderStatus {
 
 #[derive(Clone, Copy, strum_macros::Display)]
 pub(crate) enum EventSource {
-    Fills,
     OrderStatuses,
     OrderDiffs,
 }
@@ -76,7 +72,6 @@ impl EventSource {
     #[must_use]
     pub(crate) fn event_source_dir(self, dir: &Path) -> PathBuf {
         match self {
-            Self::Fills => dir.join("hl/data/node_fills_by_block"),
             Self::OrderStatuses => dir.join("hl/data/node_order_statuses_by_block"),
             Self::OrderDiffs => dir.join("hl/data/node_raw_book_diffs_by_block"),
         }

@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     order_book::types::Side,
-    types::node_data::{NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
+    types::node_data::{NodeDataOrderDiff, NodeDataOrderStatus},
 };
 
 pub(crate) mod inner;
@@ -51,22 +51,6 @@ pub(crate) enum L4Book {
 impl L2Book {
     pub(crate) const fn from_l2_snapshot(coin: String, snapshot: [Vec<Level>; 2], time: u64) -> Self {
         Self { coin, time, levels: snapshot }
-    }
-}
-
-impl Trade {
-    pub(crate) fn from_single_fill(fill: NodeDataFill) -> Self {
-        let NodeDataFill(user, fill_data) = fill;
-        Self {
-            coin: fill_data.coin,
-            side: fill_data.side,
-            px: fill_data.px,
-            sz: fill_data.sz,
-            hash: fill_data.hash,
-            time: fill_data.time,
-            tid: fill_data.tid,
-            user,
-        }
     }
 }
 
@@ -120,32 +104,4 @@ pub(crate) enum OrderDiff {
         new_sz: String,
     },
     Remove,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct Fill {
-    pub coin: String,
-    pub px: String,
-    pub sz: String,
-    pub side: Side,
-    pub time: u64,
-    pub start_position: String,
-    pub dir: String,
-    pub closed_pnl: String,
-    pub hash: String,
-    pub oid: u64,
-    pub crossed: bool,
-    pub fee: String,
-    pub tid: u64,
-    pub fee_token: String,
-    pub liquidation: Option<Liquidation>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct Liquidation {
-    liquidated_user: String,
-    mark_px: String,
-    method: String,
 }

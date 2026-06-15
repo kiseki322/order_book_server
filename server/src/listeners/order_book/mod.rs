@@ -29,11 +29,11 @@ use crate::{
         multi_book::{Snapshots, load_snapshots_from_json},
     },
     prelude::*,
-    servers::websocket_server::{coin_to_book_updates, coin_to_trades},
+    servers::websocket_server::coin_to_book_updates,
     types::{
-        L4BookUpdates, L4Order, Trade,
+        L4BookUpdates, L4Order,
         inner::{InnerL4Order, InnerLevel},
-        node_data::{Batch, EventSource, NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
+        node_data::{Batch, EventSource, NodeDataOrderDiff, NodeDataOrderStatus},
     },
 };
 
@@ -48,11 +48,9 @@ pub(crate) async fn hl_listen(
     inactivity_exit_secs: u64,
 ) -> Result<()> {
     let order_statuses_dir = EventSource::OrderStatuses.event_source_dir(&dir).canonicalize()?;
-    let fills_dir = EventSource::Fills.event_source_dir(&dir).canonicalize()?;
     let order_diffs_dir = EventSource::OrderDiffs.event_source_dir(&dir).canonicalize()?;
     info!("Monitoring order status directory: {}", order_statuses_dir.display());
     info!("Monitoring order diffs directory: {}", order_diffs_dir.display());
-    info!("Monitoring fills directory: {}", fills_dir.display());
 
     // monitoring the directory via the notify crate (gives file system events)
     let (fs_event_tx, mut fs_event_rx) = unbounded_channel();
@@ -74,7 +72,6 @@ pub(crate) async fn hl_listen(
     let fetch_in_progress = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     watcher.watch(&order_statuses_dir, RecursiveMode::Recursive)?;
-    watcher.watch(&fills_dir, RecursiveMode::Recursive)?;
     watcher.watch(&order_diffs_dir, RecursiveMode::Recursive)?;
     let start = Instant::now() + Duration::from_secs(5);
     let mut ticker = interval_at(start, Duration::from_secs(10));
@@ -90,12 +87,6 @@ pub(crate) async fn hl_listen(
                                 .await
                                 .process_update(&event, new_path, EventSource::OrderStatuses)
                                 .map_err(|err| format!("Order status processing error: {err}"))?;
-                        } else if new_path.starts_with(&fills_dir) && new_path.is_file() {
-                            listener
-                                .lock()
-                                .await
-                                .process_update(&event, new_path, EventSource::Fills)
-                                .map_err(|err| format!("Fill update processing error: {err}"))?;
                         } else if new_path.starts_with(&order_diffs_dir) && new_path.is_file() {
                             listener
                                 .lock()
@@ -210,12 +201,10 @@ fn fetch_snapshot(
 
 pub(crate) struct OrderBookListener {
     ignore_spot: bool,
-    fill_status_file: Option<File>,
     order_status_file: Option<File>,
     order_diff_file: Option<File>,
     // None if we haven't seen a valid snapshot yet
     order_book_state: Option<OrderBookState>,
-    last_fill: Option<u64>,
     order_diff_cache: BatchQueue<NodeDataOrderDiff>,
     order_status_cache: BatchQueue<NodeDataOrderStatus>,
     // Only Some when we want it to collect updates
@@ -229,11 +218,9 @@ impl OrderBookListener {
     pub(crate) fn new(internal_message_tx: Option<Sender<Arc<InternalMessage>>>, ignore_spot: bool) -> Self {
         Self {
             ignore_spot,
-            fill_status_file: None,
             order_status_file: None,
             order_diff_file: None,
             order_book_state: None,
-            last_fill: None,
             fetched_snapshot_cache: None,
             internal_message_tx,
             order_diff_cache: BatchQueue::new(),
@@ -288,15 +275,6 @@ impl OrderBookListener {
             }
             EventBatch::BookDiffs(batch) => {
                 self.order_diff_cache.push(batch);
-            }
-            EventBatch::Fills(batch) => {
-                if self.last_fill.is_none_or(|height| height < batch.block_number()) {
-                    if let Some(tx) = &self.internal_message_tx {
-                        let trades = Arc::new(coin_to_trades(&batch));
-                        let msg = Arc::new(InternalMessage::Fills { trades });
-                        drop(tx.send(msg));
-                    }
-                }
             }
         }
 
@@ -384,7 +362,6 @@ impl OrderBookListener {
 impl DirectoryListener for OrderBookListener {
     fn is_reading(&self, event_source: EventSource) -> bool {
         match event_source {
-            EventSource::Fills => self.fill_status_file.is_some(),
             EventSource::OrderStatuses => self.order_status_file.is_some(),
             EventSource::OrderDiffs => self.order_diff_file.is_some(),
         }
@@ -392,7 +369,6 @@ impl DirectoryListener for OrderBookListener {
 
     fn file_mut(&mut self, event_source: EventSource) -> &mut Option<File> {
         match event_source {
-            EventSource::Fills => &mut self.fill_status_file,
             EventSource::OrderStatuses => &mut self.order_status_file,
             EventSource::OrderDiffs => &mut self.order_diff_file,
         }
@@ -418,10 +394,6 @@ impl DirectoryListener for OrderBookListener {
                 continue;
             }
             let res = match event_source {
-                EventSource::Fills => sonic_rs::from_str::<Batch<NodeDataFill>>(line).map(|batch| {
-                    let height = batch.block_number();
-                    (height, EventBatch::Fills(batch))
-                }),
                 EventSource::OrderStatuses => sonic_rs::from_str::<Batch<NodeDataOrderStatus>>(line)
                     .map(|batch| (batch.block_number(), EventBatch::Orders(batch))),
                 EventSource::OrderDiffs => sonic_rs::from_str::<Batch<NodeDataOrderDiff>>(line)
@@ -486,7 +458,6 @@ pub(crate) struct TimedSnapshots {
 // Messages sent from node data listener to websocket dispatch to support streaming
 pub(crate) enum InternalMessage {
     Snapshot { l2_snapshots: Arc<L2Snapshots>, time: u64 },
-    Fills { trades: Arc<HashMap<String, Vec<Trade>>> },
     L4BookUpdates { updates: Arc<HashMap<String, L4BookUpdates>> },
 }
 

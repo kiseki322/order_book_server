@@ -30,8 +30,8 @@ use crate::{
     order_book::Coin,
     prelude::*,
     types::{
-        L2Book, L4Book, L4BookUpdates, L4Order, Trade,
-        node_data::{Batch, NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
+        L2Book, L4Book, L4BookUpdates, L4Order,
+        node_data::{Batch, NodeDataOrderDiff, NodeDataOrderStatus},
         subscription::{ClientMessage, DEFAULT_LEVELS, ServerResponse, Subscription, SubscriptionManager},
     },
 };
@@ -167,15 +167,6 @@ async fn handle_socket(
                                     }
                                 }
                             },
-                            InternalMessage::Fills { trades } => {
-                                for sub in manager.subscriptions() {
-                                    if let Subscription::Trades { coin } = sub {
-                                        if let Some(t) = trades.get(coin) {
-                                            drop(out_tx.try_send(ServerResponse::Trades(t.clone())));
-                                        }
-                                    }
-                                }
-                            },
                             InternalMessage::L4BookUpdates { updates } => {
                                 for sub in manager.subscriptions() {
                                     if let Subscription::L4Book { coin } = sub {
@@ -262,17 +253,6 @@ fn new_universe(l2_snapshots: &L2Snapshots, ignore_spot: bool) -> HashSet<String
         .iter()
         .filter_map(|(c, _)| if !c.is_spot() || !ignore_spot { Some(c.clone().value()) } else { None })
         .collect()
-}
-
-pub(crate) fn coin_to_trades(batch: &Batch<NodeDataFill>) -> HashMap<String, Vec<Trade>> {
-    let fills = batch.clone().events();
-    let mut trades: HashMap<String, Vec<Trade>> = HashMap::new();
-    for fill in fills {
-        let trade = Trade::from_single_fill(fill);
-        let coin = trade.coin.clone();
-        trades.entry(coin).or_insert_with(Vec::new).push(trade);
-    }
-    trades
 }
 
 pub(crate) fn coin_to_book_updates(

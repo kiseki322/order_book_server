@@ -14,7 +14,7 @@ use crate::{
         types::InnerOrder,
     },
     prelude::*,
-    types::node_data::{Batch, NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
+    types::node_data::{Batch, NodeDataOrderDiff, NodeDataOrderStatus},
 };
 use log::info;
 use tokio::fs;
@@ -211,7 +211,6 @@ pub(super) fn compute_l2_snapshots<O: InnerOrder + Send + Sync>(order_books: &Or
 pub(super) enum EventBatch {
     Orders(Batch<NodeDataOrderStatus>),
     BookDiffs(Batch<NodeDataOrderDiff>),
-    Fills(Batch<NodeDataFill>),
 }
 
 pub(super) struct BatchQueue<T> {
