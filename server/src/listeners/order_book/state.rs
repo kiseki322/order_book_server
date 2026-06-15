@@ -102,12 +102,25 @@ impl OrderBookState {
             if coin.is_spot() && self.ignore_spot {
                 continue;
             }
-            let inner_diff = diff.diff().try_into()?;
+            let inner_diff = match diff.diff().try_into() {
+                Ok(d) => d,
+                Err(e) => {
+                    log::error!("OrderDiffs serialization error: {:?} for oid: {:?}, raw: {:?}", e, oid, diff.diff());
+                    continue;
+                }
+            };
+
             match inner_diff {
                 InnerOrderDiff::New { sz } => {
                     if let Some(order) = order_map.remove(&oid) {
                         let time = order.time.and_utc().timestamp_millis();
-                        let mut inner_order: InnerL4Order = order.try_into()?;
+                        let mut inner_order: InnerL4Order = match order.try_into() {
+                            Ok(o) => o,
+                            Err(e) => {
+                                log::error!("OrderStatuses serialization error: {:?} for oid: {:?}", e, oid);
+                                continue;
+                            }
+                        };
                         inner_order.modify_sz(sz);
                         #[allow(clippy::unwrap_used)]
                         inner_order.convert_trigger(time.try_into().unwrap());
