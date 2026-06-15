@@ -385,38 +385,50 @@ impl DirectoryListener for OrderBookListener {
         *self.file_mut(event_source) = Some(File::open(new_file)?);
         Ok(())
     }
-
     fn process_data(&mut self, data: String, event_source: EventSource) -> Result<()> {
-        let total_len = data.len();
+        let mut bytes_consumed = 0;
         let lines = data.lines();
+
         for line in lines {
             if line.is_empty() {
+                bytes_consumed += line.len() + 1;
                 continue;
             }
+
             let res = match event_source {
-                EventSource::OrderStatuses => sonic_rs::from_str::<Batch<NodeDataOrderStatus>>(line)
+                EventSource::OrderStatuses => serde_json::from_str::<Batch<NodeDataOrderStatus>>(line)
                     .map(|batch| (batch.block_number(), EventBatch::Orders(batch))),
-                EventSource::OrderDiffs => sonic_rs::from_str::<Batch<NodeDataOrderDiff>>(line)
+                EventSource::OrderDiffs => serde_json::from_str::<Batch<NodeDataOrderDiff>>(line)
                     .map(|batch| (batch.block_number(), EventBatch::BookDiffs(batch))),
             };
+
             let (height, event_batch) = match res {
-                Ok(data) => data,
+                Ok(data) => {
+                    bytes_consumed += line.len() + 1;
+                    data
+                }
                 Err(err) => {
-                    // Build a safe preview of the line (up to 100 *characters*).
                     let preview: String = line.chars().take(100).collect();
 
-                    // if we run into a serialization error (hitting EOF), just return to last line.
                     error!(
                         "{event_source} serialization error {err}, height: {:?}, line: {:?}",
                         self.order_book_state.as_ref().map(OrderBookState::height),
                         preview,
                     );
-                    #[allow(clippy::unwrap_used)]
-                    let total_len: i64 = total_len.try_into().unwrap();
-                    self.file_mut(event_source).as_mut().map(|f| f.seek_relative(-total_len));
+
+                    if let Some(file) = self.file_mut(event_source).as_mut() {
+                        let total_len: i64 = data.as_bytes().len().try_into().unwrap_or(0);
+                        let consumed: i64 = bytes_consumed.try_into().unwrap_or(0);
+                        let offset_back = total_len - consumed;
+
+                        if offset_back > 0 {
+                            drop(file.seek(SeekFrom::Current(-offset_back)));
+                        }
+                    }
                     break;
                 }
             };
+
             if height % 100 == 0 {
                 info!("{event_source} block: {height}");
             }
@@ -425,6 +437,7 @@ impl DirectoryListener for OrderBookListener {
                 return Err(err);
             }
         }
+
         let now = Instant::now();
         if now.duration_since(self.last_snapshot_sent) >= Duration::from_millis(500) {
             let snapshot = self.l2_snapshots(true);
