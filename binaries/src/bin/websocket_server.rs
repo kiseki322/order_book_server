@@ -2,7 +2,11 @@
 use std::net::Ipv4Addr;
 
 use clap::Parser;
+use mimalloc::MiMalloc;
 use server::{Result, run_websocket_server};
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
@@ -42,6 +46,8 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    rustls::crypto::ring::default_provider().install_default().expect("Failed to install rustls crypto provider");
+
     env_logger::init();
 
     let args = Args::parse();
