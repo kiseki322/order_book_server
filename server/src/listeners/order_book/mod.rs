@@ -385,9 +385,16 @@ impl DirectoryListener for OrderBookListener {
         *self.file_mut(event_source) = Some(File::open(new_file)?);
         Ok(())
     }
+
     fn process_data(&mut self, data: String, event_source: EventSource) -> Result<()> {
+        let has_trailing_newline = data.ends_with('\n');
+        let mut lines: Vec<&str> = data.lines().collect();
+
+        if !has_trailing_newline && !lines.is_empty() {
+            lines.pop();
+        }
+
         let mut bytes_consumed = 0;
-        let lines = data.lines();
 
         for line in lines {
             if line.is_empty() {
@@ -435,6 +442,18 @@ impl DirectoryListener for OrderBookListener {
             if let Err(err) = self.receive_batch(event_batch) {
                 self.order_book_state = None;
                 return Err(err);
+            }
+        }
+
+        if !has_trailing_newline {
+            if let Some(file) = self.file_mut(event_source).as_mut() {
+                let total_len: i64 = data.as_bytes().len().try_into().unwrap_or(0);
+                let consumed: i64 = bytes_consumed.try_into().unwrap_or(0);
+                let offset_back = total_len - consumed;
+
+                if offset_back > 0 {
+                    drop(file.seek(SeekFrom::Current(-offset_back)));
+                }
             }
         }
 
